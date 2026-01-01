@@ -39,8 +39,21 @@ console.log("\n[ai-pr] pushing ...\n");
 run("git", ["push", "-u", "origin", branch]);
 
 console.log("\n[ai-pr] creating PR ...\n");
-const prArgs = ["pr", "create", "--title", title, "--fill"];
-if (body) prArgs.push("--body", body);
+
+// 우선순위: (1) AI_PR_BODY_FILE (2) argv body (3) --fill
+const prArgs = ["pr", "create", "--title", title];
+
+const prBodyFile = process.env.AI_PR_BODY_FILE;
+const hasBodyFile = prBodyFile && fs.existsSync(prBodyFile);
+
+if (hasBodyFile) {
+  prArgs.push("--body-file", prBodyFile);
+} else if (body) {
+  prArgs.push("--body", body);
+} else {
+  prArgs.push("--fill");
+}
+
 run("gh", prArgs);
 
 console.log("\n[ai-pr] done.\n");
