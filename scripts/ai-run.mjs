@@ -1,8 +1,12 @@
-import "dotenv/config";
-import fs from "node:fs/promises";
+import dotenv from "dotenv";
 import { existsSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import OpenAI from "openai";
+
+// 1) .env.local 우선 로드
+dotenv.config({ path: ".env.local" });
+// 2) 없을 경우를 대비해 .env도 로드(있으면 덮어쓰지 않음)
+dotenv.config();import fs from "node:fs/promises";
 
 const DEFAULT_BUNDLE_PATH = ".ai/PROMPT_BUNDLE.md";
 const DEFAULT_TASK_PATH = ".ai/TASK.md";
