@@ -1,0 +1,9 @@
+#define ABS_SRCDIR "/Users/minje/src/ruby-3.2.0"
+#define BUILDDIR   "/Users/minje/src/ruby-3.2.0"
+#define LIBPATHENV "DYLD_FALLBACK_LIBRARY_PATH"
+#define PRELOADENV "DYLD_INSERT_LIBRARIES"
+#define PATH_SEPARATOR ":"
+#define PATH_SEP   ':'
+#define EXTOUT     ".ext"
+#define ARCH       "arm64-darwin23"
+#define SOEXT      "dylib"
