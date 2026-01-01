@@ -5,13 +5,19 @@ import nextTs from "eslint-config-next/typescript";
 const eslintConfig = defineConfig([
   ...nextVitals,
   ...nextTs,
-  // Override default ignores of eslint-config-next.
+
+  // Override / extend ignores
   globalIgnores([
-    // Default ignores of eslint-config-next:
+    // Existing ignores
     ".next/**",
     "out/**",
     "build/**",
     "next-env.d.ts",
+
+    // Add these
+    "node_modules/**",
+    "dist/**",
+    "src/ruby-3.2.0/**",
   ]),
 ]);
 

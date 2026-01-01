@@ -1,0 +1,14 @@
+# dependencies / build
+node_modules
+.next
+dist
+out
+
+# lockfiles / generated
+pnpm-lock.yaml
+
+# OS / editors
+.DS_Store
+
+# ignore non-project/vendor content accidentally present
+src/ruby-3.2.0
