@@ -15,6 +15,7 @@ const PATCH_PATH = "patch.diff";
 const PR_BODY_PATH = ".ai/PR_BODY.md";
 const PR_BODY_EN_PATH = ".ai/PR_BODY.en.md";
 const LAST_OUTPUT_PATH = ".ai/last-output.txt";
+const GATES_LOG_PATH = ".ai/gates.log";
 
 function mustEnv(name) {
   const v = process.env[name];
@@ -27,6 +28,13 @@ function readNumber(name, fallback) {
   if (!v) return fallback;
   const n = Number(v);
   return Number.isFinite(n) ? n : fallback;
+}
+
+function readOptionalNumber(name) {
+  const v = process.env[name];
+  if (!v) return undefined;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : undefined;
 }
 
 function readString(name, fallback) {
@@ -79,7 +87,6 @@ function extractAllCodeBlocks(text, lang) {
 
 function pickBestDiff(blocks) {
   if (!blocks.length) return null;
-  // Prefer the longest diff block
   let best = blocks[0];
   for (const b of blocks) {
     if (b.length > best.length) best = b;
@@ -89,7 +96,6 @@ function pickBestDiff(blocks) {
 
 function pickBestMd(blocks) {
   if (!blocks.length) return null;
-  // Usually first is fine; fallback to longest if first is tiny
   const first = blocks[0];
   let longest = first;
   for (const b of blocks) {
@@ -135,13 +141,10 @@ function parseRequiredFilesFromTask(taskText) {
 function mustIncludeRequiredFiles(diff, requiredPaths) {
   if (!requiredPaths.length) return;
 
-  // For each required file path, diff should contain a diff header with that path
-  // e.g. diff --git a/src/... b/src/...
   const missing = [];
   for (const p of requiredPaths) {
-    const headerA = `diff --git a/${p} b/${p}`;
-    const headerB = `diff --git a\\/${p} b\\/${p}`; // not really needed; just in case
-    if (!diff.includes(headerA) && !diff.includes(headerB)) missing.push(p);
+    const header = `diff --git a/${p} b/${p}`;
+    if (!diff.includes(header)) missing.push(p);
   }
 
   if (missing.length) {
@@ -149,6 +152,25 @@ function mustIncludeRequiredFiles(diff, requiredPaths) {
       `Diff missing required files:\n- ${missing.join("\n- ")}\n` +
         `Regenerate diff including ALL required files exactly at these paths.`,
     );
+  }
+}
+
+function isUnsupportedTemperatureError(e) {
+  const msg =
+    e?.message || e?.error?.message || e?.response?.data?.error?.message || "";
+  return msg.includes("Unsupported parameter: 'temperature'");
+}
+
+async function responsesCreateWithFallback(client, params) {
+  try {
+    return await client.responses.create(params);
+  } catch (e) {
+    // temperature 미지원 모델이면 temperature 제거 후 1회 재시도
+    if (params.temperature !== undefined && isUnsupportedTemperatureError(e)) {
+      const { temperature: _t, ...rest } = params;
+      return await client.responses.create(rest);
+    }
+    throw e;
   }
 }
 
@@ -161,11 +183,11 @@ async function translatePrBodyToKorean({ client, model, text }) {
     "If English technical terms are widely used (e.g., PR, lint, typecheck), you may keep them.",
   ].join("\n");
 
-  const resp = await client.responses.create({
+  const resp = await responsesCreateWithFallback(client, {
     model,
     instructions,
     input: text,
-    temperature: 0.1,
+    // 번역은 temperature 굳이 필요 없음. (모델이 지원하면 넣고 싶으면 env로 분리)
     max_output_tokens: 1200,
     store: false,
   });
@@ -257,14 +279,18 @@ async function callAgent({
 
   const input = inputParts.join("");
 
-  const response = await client.responses.create({
+  const req = {
     model,
     instructions,
     input,
-    temperature,
     max_output_tokens: maxOutputTokens,
     store: false,
-  });
+  };
+
+  // temperature는 모델이 거부할 수 있으니 optional로만 붙임
+  if (temperature !== undefined) req.temperature = temperature;
+
+  const response = await responsesCreateWithFallback(client, req);
 
   const out = response.output_text ?? "";
   await fs.mkdir(".ai", { recursive: true });
@@ -302,7 +328,7 @@ async function callAgent({
   });
   await fs.writeFile(PR_BODY_PATH, koBody + "\n", "utf8");
 
-  // Check applicability
+  // Check applicability (more tolerant)
   const ok = runCheck("git", [
     "apply",
     "--check",
@@ -316,6 +342,19 @@ async function callAgent({
       `Generated patch is not applicable. See ${LAST_OUTPUT_PATH} and ${PATCH_PATH}`,
     );
   }
+}
+
+async function readGatesLog() {
+  try {
+    return await fs.readFile(GATES_LOG_PATH, "utf8");
+  } catch {
+    return "";
+  }
+}
+
+function tail(text, lines = 120) {
+  const arr = String(text || "").split("\n");
+  return arr.slice(-lines).join("\n");
 }
 
 async function main() {
@@ -344,7 +383,7 @@ async function main() {
 
   const model = readString("OPENAI_MODEL", "gpt-4o-mini");
   const maxOutputTokens = readNumber("OPENAI_MAX_OUTPUT_TOKENS", 2200);
-  const temperature = readNumber("OPENAI_TEMPERATURE", 0.1);
+  const temperature = readOptionalNumber("OPENAI_TEMPERATURE"); // gpt-5-mini 대응: 없으면 안 보냄
 
   let previousOut = "";
   for (let attempt = 1; attempt <= 3; attempt++) {
@@ -353,13 +392,15 @@ async function main() {
         attempt === 1
           ? ""
           : [
-              "Your previous output was invalid.",
+              "Your previous output was invalid or failed quality gates.",
               "Regenerate a correct unified diff with full headers and at least one @@ hunk per file.",
               "Do not output header-only diffs (e.g., index ...e69de29).",
               "Include ALL required files listed in the instructions.",
+              "Fix issues reported in the gates log if provided.",
             ].join(" ");
 
       await cleanupArtifacts();
+
       await callAgent({
         client,
         model,
@@ -373,14 +414,45 @@ async function main() {
         previousOut,
       });
 
-      break; // success
+      // (1) 먼저 dry-run으로 적용+게이트 통과 여부 확인
+      const dry = spawnSync(
+        "node",
+        ["scripts/ai-pr.mjs", branch, commitMsg, "--dry-run"],
+        {
+          stdio: "inherit",
+          env: { ...process.env, AI_PR_BODY_FILE: PR_BODY_PATH },
+        },
+      );
+
+      if ((dry.status ?? 1) !== 0) {
+        const gatesLog = await readGatesLog();
+        const debug = [
+          "# DRY_RUN_FAILED_GATES_LOG_TAIL",
+          tail(gatesLog, 200),
+        ].join("\n");
+        // 다음 attempt에 반영되도록 previousOut에 gates log까지 포함
+        try {
+          const last = await fs.readFile(LAST_OUTPUT_PATH, "utf8");
+          previousOut = `${last}\n\n${debug}\n`;
+        } catch {
+          previousOut = debug;
+        }
+        if (attempt === 3) {
+          throw new Error(`Dry-run failed. See ${GATES_LOG_PATH}`);
+        }
+        continue;
+      }
+
+      // dry-run 통과: 루프 탈출
+      break;
     } catch (e) {
       console.error(`[ai:run] attempt ${attempt} failed:`, e?.message || e);
 
       try {
-        previousOut = await fs.readFile(LAST_OUTPUT_PATH, "utf8");
+        const last = await fs.readFile(LAST_OUTPUT_PATH, "utf8");
+        previousOut = last;
       } catch {
-        previousOut = "";
+        // ignore
       }
 
       if (attempt === 3) throw e;
@@ -391,29 +463,6 @@ async function main() {
     `[ai:run] wrote ${PATCH_PATH}, ${PR_BODY_PATH}, ${PR_BODY_EN_PATH}`,
   );
   console.log("[ai:run] applying patch + creating PR...");
-
-  // (1) 먼저 dry-run으로 적용+게이트 통과 여부 확인 (실패하면 롤백됨)
-  const dry = spawnSync(
-    "node",
-    ["scripts/ai-pr.mjs", branch, commitMsg, "--dry-run"],
-    {
-      stdio: "inherit",
-      env: { ...process.env, AI_PR_BODY_FILE: PR_BODY_PATH },
-    },
-  );
-
-  if ((dry.status ?? 1) !== 0) {
-    // 드라이런 실패 로그를 다음 attempt의 previousOut에 추가해 재생성 품질을 올림
-    let gatesLog = "";
-    try {
-      gatesLog = await fs.readFile(".ai/gates.log", "utf8");
-    } catch {
-      gatesLog = "";
-    }
-    throw new Error(
-      `Dry-run failed. Gates log:\n${gatesLog}\n(See .ai/gates.log)`,
-    );
-  }
 
   // (2) dry-run 통과한 경우에만 실제 PR 생성
   const prRes = spawnSync("node", ["scripts/ai-pr.mjs", branch, commitMsg], {
