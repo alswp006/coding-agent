@@ -18,6 +18,8 @@ const eslintConfig = defineConfig([
     "node_modules/**",
     "dist/**",
     "src/ruby-3.2.0/**",
+    ".ai/**",
+    "patch.diff",
   ]),
 ]);
 
