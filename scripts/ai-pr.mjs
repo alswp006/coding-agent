@@ -29,6 +29,7 @@ console.log("\n[ai-pr] running quality gates ...\n");
 run("pnpm", ["test"]);
 run("pnpm", ["lint"]);
 run("pnpm", ["typecheck"]);
+run("pnpm", ["format"]);
 run("pnpm", ["format:check"]);
 
 console.log("\n[ai-pr] committing ...\n");
