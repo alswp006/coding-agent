@@ -229,7 +229,7 @@ async function callAgent({
     "- Keep changes minimal; no large refactors, no mass formatting.",
     "- Do not add dependencies unless required by the task.",
     "- Changes must pass: pnpm test, pnpm lint, pnpm typecheck, pnpm format:check.",
-    "- For Vitest test files, always import: `import { describe, it, expect } from \"vitest\";`",
+    '- For Vitest test files, always import: `import { describe, it, expect } from "vitest";`',
     "- Ensure every file is syntactically valid TypeScript (all braces/parens closed).",
     requiredFilesRule,
     diffTemplate,
@@ -385,11 +385,14 @@ async function main() {
   );
   console.log("[ai:run] applying patch + creating PR...");
 
-    // (1) 먼저 dry-run으로 적용+게이트 통과 여부 확인 (실패하면 롤백됨)
+  // (1) 먼저 dry-run으로 적용+게이트 통과 여부 확인 (실패하면 롤백됨)
   const dry = spawnSync(
     "node",
     ["scripts/ai-pr.mjs", branch, commitMsg, "--dry-run"],
-    { stdio: "inherit", env: { ...process.env, AI_PR_BODY_FILE: PR_BODY_PATH } },
+    {
+      stdio: "inherit",
+      env: { ...process.env, AI_PR_BODY_FILE: PR_BODY_PATH },
+    },
   );
 
   if ((dry.status ?? 1) !== 0) {

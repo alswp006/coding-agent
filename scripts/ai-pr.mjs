@@ -93,7 +93,10 @@ function main() {
   const dryRun = argv.includes("--dry-run");
 
   const bodyFile = readEnv("AI_PR_BODY_FILE"); // ai-run.mjs에서 주입
-  const prBody = bodyFile && fs.existsSync(bodyFile) ? fs.readFileSync(bodyFile, "utf8") : "";
+  const prBody =
+    bodyFile && fs.existsSync(bodyFile)
+      ? fs.readFileSync(bodyFile, "utf8")
+      : "";
 
   ensureAiDir();
 
@@ -113,7 +116,11 @@ function main() {
   }
 
   // patch 적용(whitespace 경고는 nowarn)
-  const apply = run("git", ["apply", "--whitespace=nowarn", "-p1", PATCH_FILE], { capture: true });
+  const apply = run(
+    "git",
+    ["apply", "--whitespace=nowarn", "-p1", PATCH_FILE],
+    { capture: true },
+  );
   if (apply.status !== 0) {
     writeGatesLog(`[git apply failed]\n${apply.stderr}\n`);
     rollback({ baseBranch, baseSha, branch });
