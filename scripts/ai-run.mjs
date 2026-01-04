@@ -167,7 +167,7 @@ async function responsesCreateWithFallback(client, params) {
   } catch (e) {
     // temperature 미지원 모델이면 temperature 제거 후 1회 재시도
     if (params.temperature !== undefined && isUnsupportedTemperatureError(e)) {
-      const { temperature: _t, ...rest } = params;
+      const { temperature, ...rest } = params;
       return await client.responses.create(rest);
     }
     throw e;
@@ -181,19 +181,21 @@ async function translatePrBodyToKorean({ client, model, text }) {
     "Do not add new content. Do not remove content.",
     "Preserve code spans/backticks, command names, filenames, and paths exactly.",
     "If English technical terms are widely used (e.g., PR, lint, typecheck), you may keep them.",
+    "Return ONLY the translated Markdown. No extra commentary.",
   ].join("\n");
 
-  const resp = await responsesCreateWithFallback(client, {
+  const params = {
     model,
     instructions,
     input: text,
-    // 번역은 temperature 굳이 필요 없음. (모델이 지원하면 넣고 싶으면 env로 분리)
     max_output_tokens: 1200,
     store: false,
-  });
+  };
+
+  const resp = await responsesCreateWithFallback(client, params);
 
   const out = (resp.output_text ?? "").trimEnd();
-  return out ? out : text;
+  return out ? out : text; // 번역이 비면 원문 유지
 }
 
 async function callAgent({
@@ -239,6 +241,8 @@ async function callAgent({
     "Return EXACTLY two blocks and nothing else:",
     "1) One unified diff inside a single ```diff code block.",
     "2) One PR body inside a single ```md code block (Summary / How to test / Risk & rollback / Notes).",
+    "Do not output any text outside the two fenced code blocks.",
+    "Do not include Markdown headings outside the ```md block.",
     "",
     "Hard requirements for the diff:",
     "- Must be valid `git diff` unified patch format: include `diff --git`, `---`, `+++`, and `@@` hunks.",
@@ -317,7 +321,7 @@ async function callAgent({
 
   await fs.writeFile(PATCH_PATH, diff + "\n", "utf8");
 
-  // PR body translation (Option 2)
+  // PR body translation
   await fs.writeFile(PR_BODY_EN_PATH, prBodyEn + "\n", "utf8");
 
   const translateModel = readString("OPENAI_TRANSLATE_MODEL", model);
@@ -386,6 +390,8 @@ async function main() {
   const temperature = readOptionalNumber("OPENAI_TEMPERATURE"); // gpt-5-mini 대응: 없으면 안 보냄
 
   let previousOut = "";
+  let success = false;
+
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
       const extraRules =
@@ -430,20 +436,21 @@ async function main() {
           "# DRY_RUN_FAILED_GATES_LOG_TAIL",
           tail(gatesLog, 200),
         ].join("\n");
-        // 다음 attempt에 반영되도록 previousOut에 gates log까지 포함
+
         try {
           const last = await fs.readFile(LAST_OUTPUT_PATH, "utf8");
           previousOut = `${last}\n\n${debug}\n`;
         } catch {
           previousOut = debug;
         }
+
         if (attempt === 3) {
           throw new Error(`Dry-run failed. See ${GATES_LOG_PATH}`);
         }
         continue;
       }
 
-      // dry-run 통과: 루프 탈출
+      success = true;
       break;
     } catch (e) {
       console.error(`[ai:run] attempt ${attempt} failed:`, e?.message || e);
@@ -457,6 +464,12 @@ async function main() {
 
       if (attempt === 3) throw e;
     }
+  }
+
+  if (!success) {
+    throw new Error(
+      `[ai:run] failed: could not generate a valid diff+md after 3 attempts. See ${LAST_OUTPUT_PATH}`,
+    );
   }
 
   console.log(
