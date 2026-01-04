@@ -1,0 +1,63 @@
+
+$ pnpm test
+
+> my-app@0.1.0 test /Users/minje/projects/nextjs-ts-template
+> vitest run
+
+
+[1m[46m RUN [49m[22m [36mv4.0.16 [39m[90m/Users/minje/projects/nextjs-ts-template[39m
+
+ [32m✓[39m src/__tests__/sum.test.ts [2m([22m[2m1 test[22m[2m)[22m[32m 1[2mms[22m[39m
+ [32m✓[39m src/domain/__tests__/normalizeInput.test.ts [2m([22m[2m4 tests[22m[2m)[22m[32m 2[2mms[22m[39m
+
+[2m Test Files [22m [1m[32m2 passed[39m[22m[90m (2)[39m
+[2m      Tests [22m [1m[32m5 passed[39m[22m[90m (5)[39m
+[2m   Start at [22m 16:13:29
+[2m   Duration [22m 118ms[2m (transform 35ms, setup 0ms, import 50ms, tests 3ms, environment 0ms)[22m
+
+
+$ pnpm lint
+
+> my-app@0.1.0 lint /Users/minje/projects/nextjs-ts-template
+> eslint .
+
+
+$ pnpm typecheck
+
+> my-app@0.1.0 typecheck /Users/minje/projects/nextjs-ts-template
+> tsc --noEmit
+
+
+$ pnpm format
+
+> my-app@0.1.0 format /Users/minje/projects/nextjs-ts-template
+> prettier -w .
+
+.github/pull_request_template.md 18ms (unchanged)
+.github/workflows/ci.yml 14ms (unchanged)
+app/globals.css 14ms (unchanged)
+app/layout.tsx 37ms (unchanged)
+app/page.tsx 9ms (unchanged)
+eslint.config.mjs 12ms (unchanged)
+next-env.d.ts 2ms (unchanged)
+next.config.ts 1ms (unchanged)
+package.json 2ms (unchanged)
+pnpm-workspace.yaml 1ms (unchanged)
+postcss.config.mjs 1ms (unchanged)
+README.md 14ms (unchanged)
+scripts/ai-bundle.mjs 5ms (unchanged)
+scripts/ai-pr.mjs 16ms (unchanged)
+scripts/ai-run.mjs 21ms (unchanged)
+src/__tests__/sum.test.ts 2ms (unchanged)
+src/domain/__tests__/normalizeInput.test.ts 3ms
+src/domain/normalizeInput.ts 2ms
+tsconfig.json 1ms (unchanged)
+vitest.config.mts 1ms (unchanged)
+
+$ pnpm format:check
+
+> my-app@0.1.0 format:check /Users/minje/projects/nextjs-ts-template
+> prettier -c .
+
+Checking formatting...
+All matched files use Prettier code style!
