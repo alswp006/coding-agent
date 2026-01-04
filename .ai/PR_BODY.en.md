@@ -1,14 +1,14 @@
 # Summary
-Implement `normalizeInput()` utility that trims and normalizes whitespace in a string.
+This PR implements the `normalizeInput()` utility function that trims whitespace and collapses consecutive whitespace characters into a single space. It also throws an error if the input is empty after trimming.
 
 # How to test
-1. Run `pnpm test` to execute the tests.
-2. Check the functionality by calling `normalizeInput()` with various string inputs.
+1. Run the tests in `src/domain/__tests__/normalizeInput.test.ts` using Vitest.
+2. Ensure all tests pass.
 
 # Risk & rollback
-- Risk: If the function does not handle edge cases correctly, it may throw unexpected errors.
-- Rollback: Revert the changes in `normalizeInput.ts` if issues arise.
+Risk: If the function does not handle edge cases correctly, it may lead to unexpected behavior in other parts of the application.
+Rollback: Revert the changes in `normalizeInput.ts` if any issues arise.
 
 # Notes
-- The utility function ensures that all whitespace is normalized and throws an error for empty strings.
-- Tests will be added in the next commit to validate the functionality.
+- The function is designed to handle strings and will throw an error for empty inputs.
+- Additional tests will be added in the corresponding test file.
