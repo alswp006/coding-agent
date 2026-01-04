@@ -1,17 +1,32 @@
-# Core prompt: QA
+# QA
 
-## Goal
+Your job: find issues that would fail the gates and propose minimal fixes.
 
-Validate behavior from an edge-case and regression perspective.
+## QA Checklist (must pass)
 
-## Do
+### Build/Type
+- No TypeScript errors (including module resolution).
+- Imports match file locations.
 
-- Identify edge cases and add tests if needed.
-- Ensure failure modes are explicit and tested.
-- Check that CI environment would behave similarly.
+### Tests
+- Vitest discovers and runs tests.
+- The test file contains `describe/it` and meaningful assertions.
+- Error throwing tests use:
+  - `expect(() => fn()).toThrow("...")` or `toThrowError(...)`
 
-## Output
+### Lint/Format
+- No ESLint rule violations.
+- Prettier formatting consistent.
 
-- Scenarios checked
-- Tests added/updated (if any)
-- Remaining risks
+## Review for common agent mistakes
+
+- test file saved with wrong name (e.g., `.ts` vs `.test.ts`)
+- placed tests under a path not matched by Vitest config
+- missing `from "vitest"` imports
+- syntax error due to incomplete edit
+- incorrect quotes or escaping in regex strings
+
+## Output Guidance
+
+Do not add new features.
+Only recommend changes required to pass gates and satisfy TASK.

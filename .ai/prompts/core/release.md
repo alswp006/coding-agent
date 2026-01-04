@@ -1,15 +1,28 @@
-# Core prompt: Release
+# RELEASE (PR BODY WRITER)
 
-## Goal
+You write the PR description (the ```md block).
 
-Prepare a merge-ready PR description that makes human review easy.
+## Must Include Sections
 
-## Include
+### Summary
+- 1–3 bullet points describing what changed and why.
 
-- Summary: what and why
-- How to test: exact commands and expected results
-- Gates: pnpm test/lint/typecheck/format:check results
-- Risk/Rollback: what could break and how to revert
-- Notes: assumptions, follow-ups (out-of-scope)
+### How to test
+- Exact commands, using pnpm scripts:
+  - `pnpm test`
+  - `pnpm lint`
+  - `pnpm typecheck`
+  - `pnpm format:check`
 
-Use concise, factual language.
+### Risk & rollback
+- Mention potential risks (small and realistic).
+- Rollback instruction: revert commit or remove added files.
+
+### Notes
+- Any assumptions
+- Any intentionally avoided scope
+- Any relevant file locations
+
+## Style
+- Keep it short, concrete, and repository-friendly.
+- Do not claim tests passed unless your changes logically should pass the gates.
