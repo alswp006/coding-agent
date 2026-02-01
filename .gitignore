@@ -26,3 +26,7 @@ build/
 .ai/last-output.txt
 .ai/PROMPT_BUNDLE.md
 patch.diff
+
+# AI agent artifacts
+.ai/
+patch.diff

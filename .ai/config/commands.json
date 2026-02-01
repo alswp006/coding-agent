@@ -1,7 +1,0 @@
-{
-  "test": "pnpm test",
-  "lint": "pnpm lint",
-  "typecheck": "pnpm typecheck",
-  "formatCheck": "pnpm format:check",
-  "build": "pnpm build"
-}
