@@ -14,7 +14,8 @@
     "format:check": "prettier -c .",
     "ai:run": "node scripts/ai-run.mjs",
     "ai:bundle": "node scripts/ai-bundle.mjs",
-    "ai:pr": "node scripts/ai-pr.mjs"
+    "ai:pr": "node scripts/ai-pr.mjs",
+    "ai:gatekeeper": "node scripts/ai-gatekeeper.mjs"
   },
   "dependencies": {
     "next": "16.1.1",

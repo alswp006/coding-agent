@@ -1,0 +1,31 @@
+name: PR Gatekeeper (MVP)
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+jobs:
+  gatekeeper:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Run Gatekeeper
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+          # MVP 튜닝 파라미터
+          GK_MAX_DIFF_LINES: "1200"
+          GK_MAX_FILES: "80"
+          GK_HIGH_RISK_KEYWORDS: "auth,oauth,jwt,payment,billing,settlement,transaction,lock,concurrency,migration,schema,.github/workflows,terraform,k8s,nginx,prod,secrets,env,security"
+        run: node scripts/ai-gatekeeper.mjs
