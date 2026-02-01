@@ -2,7 +2,6 @@ import dotenv from "dotenv";
 import fs from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { spawnSync } from "node:child_process";
-import OpenAI from "openai";
 
 // Load env files (prefer .env.local)
 dotenv.config({ path: ".env.local" });
@@ -20,7 +19,7 @@ const GATES_LOG_PATH = ".ai/gates.log";
 function mustEnv(name) {
   const v = process.env[name];
   if (!v) throw new Error(`Missing env: ${name}`);
-  return v;
+  return String(v);
 }
 
 function readNumber(name, fallback) {
@@ -155,26 +154,56 @@ function mustIncludeRequiredFiles(diff, requiredPaths) {
   }
 }
 
-function isUnsupportedTemperatureError(e) {
-  const msg =
-    e?.message || e?.error?.message || e?.response?.data?.error?.message || "";
-  return msg.includes("Unsupported parameter: 'temperature'");
-}
+/**
+ * Anthropic Messages API call (non-streaming)
+ * - Endpoint: POST https://api.anthropic.com/v1/messages
+ * - Headers: x-api-key, anthropic-version
+ */
+async function anthropicMessagesCreate({
+  apiKey,
+  model,
+  system,
+  userText,
+  maxTokens,
+  temperature,
+}) {
+  const body = {
+    model,
+    max_tokens: maxTokens,
+    messages: [{ role: "user", content: userText }],
+  };
 
-async function responsesCreateWithFallback(client, params) {
-  try {
-    return await client.responses.create(params);
-  } catch (e) {
-    // temperature 미지원 모델이면 temperature 제거 후 1회 재시도
-    if (params.temperature !== undefined && isUnsupportedTemperatureError(e)) {
-      const { temperature, ...rest } = params;
-      return await client.responses.create(rest);
-    }
-    throw e;
+  if (system && String(system).trim()) body.system = system;
+  if (temperature !== undefined) body.temperature = temperature;
+
+  const res = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-api-key": apiKey,
+      "anthropic-version": "2023-06-01",
+    },
+    body: JSON.stringify(body),
+  });
+
+  const json = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const msg = json?.error?.message || JSON.stringify(json);
+    throw new Error(
+      `Anthropic API error: ${res.status} ${res.statusText} - ${msg}`,
+    );
   }
+
+  const parts = Array.isArray(json?.content) ? json.content : [];
+  const text = parts
+    .filter((p) => p && p.type === "text")
+    .map((p) => p.text)
+    .join("");
+
+  return String(text || "");
 }
 
-async function translatePrBodyToKorean({ client, model, text }) {
+async function translatePrBodyToKorean({ model, text }) {
   const instructions = [
     "Translate the given GitHub pull request description into natural Korean.",
     "Keep the Markdown structure and headings as-is.",
@@ -184,22 +213,21 @@ async function translatePrBodyToKorean({ client, model, text }) {
     "Return ONLY the translated Markdown. No extra commentary.",
   ].join("\n");
 
-  const params = {
-    model,
-    instructions,
-    input: text,
-    max_output_tokens: 1200,
-    store: false,
-  };
+  const out = (
+    await anthropicMessagesCreate({
+      apiKey: mustEnv("ANTHROPIC_API_KEY"),
+      model,
+      system: instructions,
+      userText: text,
+      maxTokens: 1200,
+      temperature: undefined,
+    })
+  ).trimEnd();
 
-  const resp = await responsesCreateWithFallback(client, params);
-
-  const out = (resp.output_text ?? "").trimEnd();
-  return out ? out : text; // 번역이 비면 원문 유지
+  return out ? out : text;
 }
 
 async function callAgent({
-  client,
   model,
   temperature,
   maxOutputTokens,
@@ -283,20 +311,15 @@ async function callAgent({
 
   const input = inputParts.join("");
 
-  const req = {
+  const out = await anthropicMessagesCreate({
+    apiKey: mustEnv("ANTHROPIC_API_KEY"),
     model,
-    instructions,
-    input,
-    max_output_tokens: maxOutputTokens,
-    store: false,
-  };
+    system: instructions,
+    userText: input,
+    maxTokens: maxOutputTokens,
+    temperature,
+  });
 
-  // temperature는 모델이 거부할 수 있으니 optional로만 붙임
-  if (temperature !== undefined) req.temperature = temperature;
-
-  const response = await responsesCreateWithFallback(client, req);
-
-  const out = response.output_text ?? "";
   await fs.mkdir(".ai", { recursive: true });
   await fs.writeFile(LAST_OUTPUT_PATH, out, "utf8");
 
@@ -328,9 +351,8 @@ async function callAgent({
   // PR body translation
   await fs.writeFile(PR_BODY_EN_PATH, prBodyEn + "\n", "utf8");
 
-  const translateModel = readString("OPENAI_TRANSLATE_MODEL", model);
+  const translateModel = readString("ANTHROPIC_TRANSLATE_MODEL", model);
   const koBody = await translatePrBodyToKorean({
-    client,
     model: translateModel,
     text: prBodyEn,
   });
@@ -345,6 +367,7 @@ async function callAgent({
     "-p1",
     PATCH_PATH,
   ]);
+
   if (!ok) {
     throw new Error(
       `Generated patch is not applicable. See ${LAST_OUTPUT_PATH} and ${PATCH_PATH}`,
@@ -386,12 +409,12 @@ async function main() {
 
   const requiredFiles = parseRequiredFilesFromTask(task);
 
-  console.log("[ai:run] calling OpenAI...");
-  const client = new OpenAI({ apiKey: mustEnv("OPENAI_API_KEY") });
+  console.log("[ai:run] calling Claude (Anthropic)...");
+  mustEnv("ANTHROPIC_API_KEY");
 
-  const model = readString("OPENAI_MODEL", "gpt-4o-mini");
-  const maxOutputTokens = readNumber("OPENAI_MAX_OUTPUT_TOKENS", 2200);
-  const temperature = readOptionalNumber("OPENAI_TEMPERATURE"); // gpt-5-mini 대응: 없으면 안 보냄
+  const model = readString("ANTHROPIC_MODEL", "claude-sonnet-4-5");
+  const maxOutputTokens = readNumber("ANTHROPIC_MAX_OUTPUT_TOKENS", 2200);
+  const temperature = readOptionalNumber("ANTHROPIC_TEMPERATURE");
 
   let previousOut = "";
   let success = false;
@@ -412,7 +435,6 @@ async function main() {
       await cleanupArtifacts();
 
       await callAgent({
-        client,
         model,
         temperature,
         maxOutputTokens,
