@@ -21,12 +21,12 @@ build/
 # ai local artifacts
 # AI local inputs & outputs
 .ai/PR_BODY*.md
-.ai/gates.log
-.ai/gates.last.log
+.ai/gates*.log
 .ai/last-output.txt
 .ai/PROMPT_BUNDLE.md
+.ai/TASK.md
 patch.diff
 
-# AI agent artifacts
-.ai/
-patch.diff
+# optional: if you generate these
+.ai/**/*.tmp
+.ai/**/*.cache
