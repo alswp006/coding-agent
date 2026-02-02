@@ -18,15 +18,24 @@ build/
 .env.local
 .env.*.local
 
-# ai local artifacts
-# AI local inputs & outputs
-.ai/PR_BODY*.md
-.ai/gates*.log
-.ai/last-output.txt
+# --- AI runtime artifacts (generated) ---
 .ai/PROMPT_BUNDLE.md
+.ai/last-output.txt
+.ai/gates.log
+.ai/gates*.log
+.ai/PR_BODY.md
+.ai/PR_BODY*.md
 .ai/TASK.md
 patch.diff
 
 # optional: if you generate these
 .ai/**/*.tmp
 .ai/**/*.cache
+
+# queue local state (do not commit)
+.ai/queue.state.json
+
+# dumps
+.ai/agent-dump/
+.ai/*.tar.gz
+ai-agent-dump*.tar.gz

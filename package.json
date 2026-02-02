@@ -1,5 +1,5 @@
 {
-  "name": "my-app",
+  "name": "coding-agent",
   "version": "0.1.0",
   "private": true,
   "scripts": {
@@ -15,7 +15,9 @@
     "ai:run": "node scripts/ai-run.mjs",
     "ai:bundle": "node scripts/ai-bundle.mjs",
     "ai:pr": "node scripts/ai-pr.mjs",
-    "ai:gatekeeper": "node scripts/ai-gatekeeper.mjs"
+    "ai:gatekeeper": "node scripts/ai-gatekeeper.mjs",
+    "ai:next": "node scripts/ai-next.mjs",
+    "ai:review": "node scripts/ai-review.mjs"
   },
   "dependencies": {
     "next": "16.1.1",
