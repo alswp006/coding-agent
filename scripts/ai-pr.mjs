@@ -5,6 +5,12 @@ const PATCH_FILE = "patch.diff";
 const GATES_LOG = ".ai/gates.log";
 const GATES_LAST_LOG = ".ai/gates.last.log";
 
+/**
+ * If set, stage only these files (newline-separated).
+ * Provided by ai-run.mjs
+ */
+const ENV_STAGE_FILES = "AI_STAGE_FILES";
+
 function ensureAiDir() {
   fs.mkdirSync(".ai", { recursive: true });
 }
@@ -64,7 +70,7 @@ function rollback({ baseBranch, baseSha, branch }) {
   // 작업 브랜치에서 변경사항 제거
   run("git", ["reset", "--hard", baseSha]);
 
-  // 중요: 로그는 지우지 않도록 제외(-e)
+  // 중요: 로그/아티팩트는 지우지 않도록 제외(-e)
   run("git", [
     "clean",
     "-fd",
@@ -111,6 +117,76 @@ function runGatesCapture() {
     if (r.status !== 0) return { ok: false, log: out, code: r.status };
   }
   return { ok: true, log: out, code: 0 };
+}
+
+/**
+ * Parse AI_STAGE_FILES (newline-separated) into a safe argv list.
+ * - trims
+ * - removes empties
+ * - rejects absolute paths and parent traversal
+ */
+function parseStageFiles() {
+  const raw = readEnv(ENV_STAGE_FILES).trim();
+  if (!raw) return [];
+
+  const files = raw
+    .split("\n")
+    .map((s) => s.trim())
+    .filter(Boolean);
+
+  const safe = [];
+  for (const f of files) {
+    if (f.startsWith("/") || f.startsWith("~")) continue;
+    if (f.includes("..")) continue;
+    safe.push(f);
+  }
+  return Array.from(new Set(safe));
+}
+
+/**
+ * Avoid staging cache/build outputs even if patch touched them.
+ * (You can relax this later if you truly want to commit them.)
+ */
+function isIgnoredFromStaging(p) {
+  // hard skip for common junk / accidental tracked caches
+  const denyPrefixes = [
+    "node_modules/",
+    ".next/",
+    "dist/",
+    "build/",
+    ".turbo/",
+    ".vite/",
+    ".pnpm-store/",
+  ];
+
+  for (const pref of denyPrefixes) {
+    if (p === pref.slice(0, -1) || p.startsWith(pref)) return true;
+  }
+
+  // known bad file from your logs
+  if (p.includes("node_modules/.vite/")) return true;
+  return false;
+}
+
+function stageOnlyTouchedFilesOrAll() {
+  const files = parseStageFiles().filter((p) => !isIgnoredFromStaging(p));
+
+  if (files.length) {
+    // Stage only listed files
+    const res = run("git", ["add", "--", ...files], { capture: true });
+    if (res.status !== 0) {
+      // Fallback to add -A, but still try to keep junk out
+      process.stderr.write(
+        `[ai-pr] warning: git add of AI_STAGE_FILES failed, falling back to git add -A\n${res.stderr}\n`,
+      );
+      must("git", ["add", "-A"]);
+      return;
+    }
+    return;
+  }
+
+  // No stage list -> default behavior
+  must("git", ["add", "-A"]);
 }
 
 function main() {
@@ -188,7 +264,7 @@ function main() {
   }
 
   // 커밋/푸시/PR
-  must("git", ["add", "-A"]);
+  stageOnlyTouchedFilesOrAll();
   must("git", ["commit", "-m", title]);
   must("git", ["push", "-u", "origin", branch]);
 

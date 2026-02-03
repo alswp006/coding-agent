@@ -1,5 +1,6 @@
 import dotenv from "dotenv";
 import fs from "node:fs/promises";
+import path from "node:path";
 import { existsSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 
@@ -41,9 +42,28 @@ function readString(name, fallback) {
   return v && String(v).trim() ? String(v).trim() : fallback;
 }
 
-async function rmIfExists(path) {
+function run(cmd, args, opts = {}) {
+  const r = spawnSync(cmd, args, { stdio: "inherit", ...opts });
+  return r.status ?? 1;
+}
+
+function assertCleanWorkingTree() {
+  const r = spawnSync("git", ["status", "--porcelain"], {
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  const out = String(r.stdout || "").trim();
+  if (out) {
+    throw new Error(
+      "Working tree is not clean. Commit/stash or revert changes before running ai:run.\n" +
+        "Tip: tracked node_modules / build caches will break patch application.\n\n" +
+        out,
+    );
+  }
+}
+
+async function rmIfExists(p) {
   try {
-    await fs.rm(path, { force: true, recursive: false });
+    await fs.rm(p, { force: true, recursive: false });
   } catch {
     // ignore
   }
@@ -54,6 +74,8 @@ async function cleanupArtifacts() {
   await rmIfExists(PR_BODY_PATH);
   await rmIfExists(PR_BODY_EN_PATH);
   await rmIfExists(LAST_OUTPUT_PATH);
+
+  // 🔒 cleanup: prevent accidental duplicate configs left by bad outputs
   await rmIfExists("vitest.config.ts");
   await rmIfExists("vitest.setup.ts");
 }
@@ -154,6 +176,45 @@ function mustIncludeRequiredFiles(diff, requiredPaths) {
         `Regenerate diff including ALL required files exactly at these paths.`,
     );
   }
+}
+
+function mustNotIntroduceForbiddenFiles(diff) {
+  const forbidden = [
+    "vitest.config.ts",
+    "vitest.config.js",
+    "vitest.config.cjs",
+    "vitest.config.mjs",
+    "vitest.setup.ts",
+  ];
+
+  for (const f of forbidden) {
+    const safe = f.replace(/\./g, "\\.");
+    const re = new RegExp(`^diff --git a/${safe} b/${safe}$`, "m");
+    if (re.test(diff)) {
+      throw new Error(
+        `Forbidden change detected: ${f}. This repo already uses vitest.config.mts. Regenerate without touching ${f}.`,
+      );
+    }
+  }
+}
+
+function parseTouchedFilesFromDiff(diff) {
+  const files = [];
+  const re = /^diff --git a\/(.+?) b\/(.+?)$/gm;
+  let m;
+  while ((m = re.exec(diff)) !== null) {
+    const a = m[1];
+    const b = m[2];
+    const p = b || a;
+    if (!p) continue;
+
+    // basic safety
+    if (p.includes("..")) continue;
+    if (path.isAbsolute(p)) continue;
+
+    files.push(p);
+  }
+  return Array.from(new Set(files));
 }
 
 /**
@@ -342,29 +403,6 @@ async function callAgent({
   const diff = pickBestDiff(diffBlocks);
   const prBodyEn = pickBestMd(mdBlocks);
 
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars
-  function _mustNotIntroduceForbiddenFiles(diff) {
-    const forbidden = [
-      "vitest.config.ts",
-      "vitest.config.js",
-      "vitest.config.cjs",
-      "vitest.config.mjs",
-    ];
-
-    // vitest.config.mts가 이미 있는 레포에서는 위 파일들 추가 금지
-    for (const f of forbidden) {
-      const re = new RegExp(
-        `^diff --git a/${f.replace(/\./g, "\\.")} b/${f.replace(/\./g, "\\.")}$`,
-        "m",
-      );
-      if (re.test(diff)) {
-        throw new Error(
-          `Forbidden change detected: ${f}. This repo already uses vitest.config.mts. Regenerate without creating/modifying ${f}.`,
-        );
-      }
-    }
-  }
-
   if (!diff) throw new Error(`No diff block found. See ${LAST_OUTPUT_PATH}`);
   if (!prBodyEn)
     throw new Error(`No md PR body block found. See ${LAST_OUTPUT_PATH}`);
@@ -374,6 +412,9 @@ async function callAgent({
       `Invalid unified diff (missing headers or @@ hunk). See ${LAST_OUTPUT_PATH}`,
     );
   }
+
+  // 🔒 Hard safety checks
+  mustNotIntroduceForbiddenFiles(diff);
 
   // Ensure required files are included in the diff
   mustIncludeRequiredFiles(diff, requiredFiles);
@@ -405,6 +446,9 @@ async function callAgent({
       `Generated patch is not applicable. See ${LAST_OUTPUT_PATH} and ${PATCH_PATH}`,
     );
   }
+
+  // Return touched files for later stage control
+  return parseTouchedFilesFromDiff(diff);
 }
 
 async function readGatesLog() {
@@ -424,11 +468,14 @@ async function main() {
   const branch = process.argv[2] ?? "feat/ai-run";
   const commitMsg = process.argv[3] ?? "chore: apply ai patch";
 
+  // 🔒 start clean only
+  assertCleanWorkingTree();
+
   await cleanupArtifacts();
 
   console.log("[ai:run] bundling prompt...");
-  const bundleRes = spawnSync("pnpm", ["ai:bundle"], { stdio: "inherit" });
-  if (bundleRes.status !== 0) process.exit(bundleRes.status ?? 1);
+  const bundleStatus = run("pnpm", ["ai:bundle"]);
+  if (bundleStatus !== 0) process.exit(bundleStatus);
 
   if (!existsSync(DEFAULT_BUNDLE_PATH))
     throw new Error(`Bundle not found: ${DEFAULT_BUNDLE_PATH}`);
@@ -464,27 +511,41 @@ async function main() {
               "Fix issues reported in the gates log if provided.",
             ].join(" ");
 
+      // 🔒 Prevent patch apply failures from “guess edits”
+      const behavioralRules = [
+        "Do NOT modify existing test files unless TASK explicitly asks.",
+        "Specifically: do NOT modify src/__tests__/smoke.test.ts. Create a new test file instead if needed.",
+        "Prefer creating new files over editing existing ones if you are unsure about current file contents.",
+      ].join("\n");
+
       await cleanupArtifacts();
 
-      await callAgent({
+      const touchedFiles = await callAgent({
         model,
         temperature,
         maxOutputTokens,
         bundle,
         task,
         requiredFiles,
-        extraRules,
+        extraRules: [extraRules, behavioralRules].filter(Boolean).join("\n\n"),
         attempt,
         previousOut,
       });
 
-      // (1) 먼저 dry-run으로 적용+게이트 통과 여부 확인
+      const stageList = touchedFiles.join("\n");
+
+      // (1) dry-run: apply patch + run gates
       const dry = spawnSync(
         "node",
         ["scripts/ai-pr.mjs", branch, commitMsg, "--dry-run"],
         {
           stdio: "inherit",
-          env: { ...process.env, AI_PR_BODY_FILE: PR_BODY_PATH },
+          env: {
+            ...process.env,
+            AI_PR_BODY_FILE: PR_BODY_PATH,
+            // ✅ touched files만 stage 하도록 ai-pr에 전달(지원하면 강력)
+            AI_STAGE_FILES: stageList,
+          },
         },
       );
 
@@ -536,9 +597,20 @@ async function main() {
   console.log("[ai:run] applying patch + creating PR...");
 
   // (2) dry-run 통과한 경우에만 실제 PR 생성
+  const patchText = existsSync(PATCH_PATH)
+    ? await fs.readFile(PATCH_PATH, "utf8")
+    : "";
+  const touched = patchText
+    ? parseTouchedFilesFromDiff(patchText).join("\n")
+    : "";
+
   const prRes = spawnSync("node", ["scripts/ai-pr.mjs", branch, commitMsg], {
     stdio: "inherit",
-    env: { ...process.env, AI_PR_BODY_FILE: PR_BODY_PATH },
+    env: {
+      ...process.env,
+      AI_PR_BODY_FILE: PR_BODY_PATH,
+      AI_STAGE_FILES: touched,
+    },
   });
 
   process.exit(prRes.status ?? 1);
