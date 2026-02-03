@@ -54,6 +54,8 @@ async function cleanupArtifacts() {
   await rmIfExists(PR_BODY_PATH);
   await rmIfExists(PR_BODY_EN_PATH);
   await rmIfExists(LAST_OUTPUT_PATH);
+  await rmIfExists("vitest.config.ts");
+  await rmIfExists("vitest.setup.ts");
 }
 
 function runCheck(cmd, args) {
@@ -285,6 +287,13 @@ async function callAgent({
     "- Changes must pass: pnpm test, pnpm lint, pnpm typecheck, pnpm format:check.",
     '- For Vitest test files, always import: `import { describe, it, expect } from "vitest";`',
     "- Ensure every file is syntactically valid TypeScript (all braces/parens closed).",
+    "",
+    "Repo invariants:",
+    "- Do NOT create or modify any test runner config files unless TASK explicitly asks.",
+    "- Specifically: if vitest.config.mts exists, NEVER create vitest.config.ts (or vitest.config.js).",
+    "- Never add vitest.setup.ts unless an existing vitest config already references it.",
+    "- If tests fail due to config/tooling, prefer minimal code/test changes; avoid config churn.",
+    "",
     requiredFilesRule,
     diffTemplate,
   ].filter(Boolean);
@@ -332,6 +341,28 @@ async function callAgent({
 
   const diff = pickBestDiff(diffBlocks);
   const prBodyEn = pickBestMd(mdBlocks);
+
+  function mustNotIntroduceForbiddenFiles(diff) {
+    const forbidden = [
+      "vitest.config.ts",
+      "vitest.config.js",
+      "vitest.config.cjs",
+      "vitest.config.mjs",
+    ];
+
+    // vitest.config.mts가 이미 있는 레포에서는 위 파일들 추가 금지
+    for (const f of forbidden) {
+      const re = new RegExp(
+        `^diff --git a/${f.replace(/\./g, "\\.")} b/${f.replace(/\./g, "\\.")}$`,
+        "m",
+      );
+      if (re.test(diff)) {
+        throw new Error(
+          `Forbidden change detected: ${f}. This repo already uses vitest.config.mts. Regenerate without creating/modifying ${f}.`,
+        );
+      }
+    }
+  }
 
   if (!diff) throw new Error(`No diff block found. See ${LAST_OUTPUT_PATH}`);
   if (!prBodyEn)
