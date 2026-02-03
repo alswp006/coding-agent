@@ -1,6 +1,5 @@
 import dotenv from "dotenv";
 import fs from "node:fs/promises";
-import path from "node:path";
 import { existsSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 
@@ -16,6 +15,26 @@ const PR_BODY_PATH = ".ai/PR_BODY.md";
 const PR_BODY_EN_PATH = ".ai/PR_BODY.en.md";
 const LAST_OUTPUT_PATH = ".ai/last-output.txt";
 const GATES_LOG_PATH = ".ai/gates.log";
+
+// === Hard repo invariants / forbidden patterns ===
+// 이 레포 템플릿은 "기본 Vitest"만 가정.
+// React Testing Library / jest-dom / DOM matcher / __tests__ under app/* 는 금지.
+// (정말 필요하면 TASK에 명시하고, 템플릿 PR로 deps+config를 먼저 넣어야 함)
+const FORBIDDEN_DIFF_PATTERNS = [
+  // Testing Library stack
+  /@testing-library\/react/g,
+  /@testing-library\/jest-dom/g,
+  /@testing-library\/user-event/g,
+  /\btoBeInTheDocument\b/g,
+  /\brender\(/g,
+
+  // app router 쪽에서 __tests__ 만들지 않기 (typecheck/lint 파편화 방지)
+  /diff --git a\/app\/.*\/__tests__\/.* b\/app\/.*\/__tests__\/.*/g,
+
+  // 혹시 모르니 vitest config churn도 원천 차단
+  /diff --git a\/vitest\.config\.(ts|js|cjs|mjs) b\/vitest\.config\.(ts|js|cjs|mjs)/g,
+  /diff --git a\/vitest\.setup\.ts b\/vitest\.setup\.ts/g,
+];
 
 function mustEnv(name) {
   const v = process.env[name];
@@ -42,28 +61,9 @@ function readString(name, fallback) {
   return v && String(v).trim() ? String(v).trim() : fallback;
 }
 
-function run(cmd, args, opts = {}) {
-  const r = spawnSync(cmd, args, { stdio: "inherit", ...opts });
-  return r.status ?? 1;
-}
-
-function assertCleanWorkingTree() {
-  const r = spawnSync("git", ["status", "--porcelain"], {
-    stdio: ["ignore", "pipe", "pipe"],
-  });
-  const out = String(r.stdout || "").trim();
-  if (out) {
-    throw new Error(
-      "Working tree is not clean. Commit/stash or revert changes before running ai:run.\n" +
-        "Tip: tracked node_modules / build caches will break patch application.\n\n" +
-        out,
-    );
-  }
-}
-
-async function rmIfExists(p) {
+async function rmIfExists(path) {
   try {
-    await fs.rm(p, { force: true, recursive: false });
+    await fs.rm(path, { force: true, recursive: false });
   } catch {
     // ignore
   }
@@ -75,9 +75,9 @@ async function cleanupArtifacts() {
   await rmIfExists(PR_BODY_EN_PATH);
   await rmIfExists(LAST_OUTPUT_PATH);
 
-  // 🔒 cleanup: prevent accidental duplicate configs left by bad outputs
-  await rmIfExists("vitest.config.ts");
-  await rmIfExists("vitest.setup.ts");
+  // IMPORTANT: 아래는 "삭제 금지" (레포 고정 config 파일을 ai-run이 지우면 안 됨)
+  // await rmIfExists("vitest.config.ts");
+  // await rmIfExists("vitest.setup.ts");
 }
 
 function runCheck(cmd, args) {
@@ -178,49 +178,28 @@ function mustIncludeRequiredFiles(diff, requiredPaths) {
   }
 }
 
-function mustNotIntroduceForbiddenFiles(diff) {
-  const forbidden = [
-    "vitest.config.ts",
-    "vitest.config.js",
-    "vitest.config.cjs",
-    "vitest.config.mjs",
-    "vitest.setup.ts",
-  ];
-
-  for (const f of forbidden) {
-    const safe = f.replace(/\./g, "\\.");
-    const re = new RegExp(`^diff --git a/${safe} b/${safe}$`, "m");
-    if (re.test(diff)) {
-      throw new Error(
-        `Forbidden change detected: ${f}. This repo already uses vitest.config.mts. Regenerate without touching ${f}.`,
-      );
-    }
+function assertNoForbiddenDiff(diff) {
+  const hits = [];
+  for (const re of FORBIDDEN_DIFF_PATTERNS) {
+    re.lastIndex = 0;
+    if (re.test(diff)) hits.push(String(re));
   }
-}
-
-function parseTouchedFilesFromDiff(diff) {
-  const files = [];
-  const re = /^diff --git a\/(.+?) b\/(.+?)$/gm;
-  let m;
-  while ((m = re.exec(diff)) !== null) {
-    const a = m[1];
-    const b = m[2];
-    const p = b || a;
-    if (!p) continue;
-
-    // basic safety
-    if (p.includes("..")) continue;
-    if (path.isAbsolute(p)) continue;
-
-    files.push(p);
+  if (hits.length) {
+    throw new Error(
+      [
+        "Forbidden patterns detected in generated diff.",
+        "This repo template does NOT allow RTL/jest-dom or app/**/__tests__ in AI runs.",
+        "Matched:",
+        ...hits.map((h) => `- ${h}`),
+        "",
+        "Regenerate WITHOUT those dependencies/patterns and avoid creating component tests.",
+      ].join("\n"),
+    );
   }
-  return Array.from(new Set(files));
 }
 
 /**
  * Anthropic Messages API call (non-streaming)
- * - Endpoint: POST https://api.anthropic.com/v1/messages
- * - Headers: x-api-key, anthropic-version
  */
 async function anthropicMessagesCreate({
   apiKey,
@@ -349,11 +328,15 @@ async function callAgent({
     '- For Vitest test files, always import: `import { describe, it, expect } from "vitest";`',
     "- Ensure every file is syntactically valid TypeScript (all braces/parens closed).",
     "",
-    "Repo invariants:",
+    "Repo invariants (hard):",
     "- Do NOT create or modify any test runner config files unless TASK explicitly asks.",
-    "- Specifically: if vitest.config.mts exists, NEVER create vitest.config.ts (or vitest.config.js).",
+    "- Specifically: if vitest.config.mts exists, NEVER create vitest.config.ts (or vitest.config.js/cjs/mjs).",
     "- Never add vitest.setup.ts unless an existing vitest config already references it.",
-    "- If tests fail due to config/tooling, prefer minimal code/test changes; avoid config churn.",
+    "",
+    "Testing policy (hard):",
+    "- Do NOT add @testing-library/* or jest-dom or DOM matchers (toBeInTheDocument).",
+    "- Do NOT create component tests under app/**/__tests__.",
+    "- If tests are needed, keep them as simple Vitest unit tests that do not require extra deps.",
     "",
     requiredFilesRule,
     diffTemplate,
@@ -413,8 +396,9 @@ async function callAgent({
     );
   }
 
-  // 🔒 Hard safety checks
-  mustNotIntroduceForbiddenFiles(diff);
+  // === NEW: hard local guardrail ===
+  // 프롬프트가 안 지켜져도, 여기서 무조건 컷.
+  assertNoForbiddenDiff(diff);
 
   // Ensure required files are included in the diff
   mustIncludeRequiredFiles(diff, requiredFiles);
@@ -446,9 +430,6 @@ async function callAgent({
       `Generated patch is not applicable. See ${LAST_OUTPUT_PATH} and ${PATCH_PATH}`,
     );
   }
-
-  // Return touched files for later stage control
-  return parseTouchedFilesFromDiff(diff);
 }
 
 async function readGatesLog() {
@@ -468,14 +449,11 @@ async function main() {
   const branch = process.argv[2] ?? "feat/ai-run";
   const commitMsg = process.argv[3] ?? "chore: apply ai patch";
 
-  // 🔒 start clean only
-  assertCleanWorkingTree();
-
   await cleanupArtifacts();
 
   console.log("[ai:run] bundling prompt...");
-  const bundleStatus = run("pnpm", ["ai:bundle"]);
-  if (bundleStatus !== 0) process.exit(bundleStatus);
+  const bundleRes = spawnSync("pnpm", ["ai:bundle"], { stdio: "inherit" });
+  if (bundleRes.status !== 0) process.exit(bundleRes.status ?? 1);
 
   if (!existsSync(DEFAULT_BUNDLE_PATH))
     throw new Error(`Bundle not found: ${DEFAULT_BUNDLE_PATH}`);
@@ -509,43 +487,30 @@ async function main() {
               "Do not output header-only diffs (e.g., index ...e69de29).",
               "Include ALL required files listed in the instructions.",
               "Fix issues reported in the gates log if provided.",
+              "Strictly follow Testing policy: no @testing-library/*, no jest-dom, no app/**/__tests__.",
             ].join(" ");
-
-      // 🔒 Prevent patch apply failures from “guess edits”
-      const behavioralRules = [
-        "Do NOT modify existing test files unless TASK explicitly asks.",
-        "Specifically: do NOT modify src/__tests__/smoke.test.ts. Create a new test file instead if needed.",
-        "Prefer creating new files over editing existing ones if you are unsure about current file contents.",
-      ].join("\n");
 
       await cleanupArtifacts();
 
-      const touchedFiles = await callAgent({
+      await callAgent({
         model,
         temperature,
         maxOutputTokens,
         bundle,
         task,
         requiredFiles,
-        extraRules: [extraRules, behavioralRules].filter(Boolean).join("\n\n"),
+        extraRules,
         attempt,
         previousOut,
       });
 
-      const stageList = touchedFiles.join("\n");
-
-      // (1) dry-run: apply patch + run gates
+      // (1) dry-run으로 적용+게이트 통과 여부 확인
       const dry = spawnSync(
         "node",
         ["scripts/ai-pr.mjs", branch, commitMsg, "--dry-run"],
         {
           stdio: "inherit",
-          env: {
-            ...process.env,
-            AI_PR_BODY_FILE: PR_BODY_PATH,
-            // ✅ touched files만 stage 하도록 ai-pr에 전달(지원하면 강력)
-            AI_STAGE_FILES: stageList,
-          },
+          env: { ...process.env, AI_PR_BODY_FILE: PR_BODY_PATH },
         },
       );
 
@@ -597,20 +562,9 @@ async function main() {
   console.log("[ai:run] applying patch + creating PR...");
 
   // (2) dry-run 통과한 경우에만 실제 PR 생성
-  const patchText = existsSync(PATCH_PATH)
-    ? await fs.readFile(PATCH_PATH, "utf8")
-    : "";
-  const touched = patchText
-    ? parseTouchedFilesFromDiff(patchText).join("\n")
-    : "";
-
   const prRes = spawnSync("node", ["scripts/ai-pr.mjs", branch, commitMsg], {
     stdio: "inherit",
-    env: {
-      ...process.env,
-      AI_PR_BODY_FILE: PR_BODY_PATH,
-      AI_STAGE_FILES: touched,
-    },
+    env: { ...process.env, AI_PR_BODY_FILE: PR_BODY_PATH },
   });
 
   process.exit(prRes.status ?? 1);
