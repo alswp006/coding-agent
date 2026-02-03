@@ -1,8 +1,8 @@
 import fs from "node:fs/promises";
 import { existsSync } from "node:fs";
 
-const GH_API = "https://api.github.com"\;
-const OPENAI_API = "https://api.openai.com/v1/responses"\;
+const GH_API = "https://api.github.com";
+const OPENAI_API = "https://api.openai.com/v1/responses";
 
 function mustEnv(name) {
   const v = process.env[name];
