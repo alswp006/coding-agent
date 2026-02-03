@@ -342,7 +342,8 @@ async function callAgent({
   const diff = pickBestDiff(diffBlocks);
   const prBodyEn = pickBestMd(mdBlocks);
 
-  function mustNotIntroduceForbiddenFiles(diff) {
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  function _mustNotIntroduceForbiddenFiles(diff) {
     const forbidden = [
       "vitest.config.ts",
       "vitest.config.js",

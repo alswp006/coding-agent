@@ -7,7 +7,7 @@ function mustString(v, name) {
 }
 
 function asStringArray(v, name) {
-  if (!Array.isArray(v)) return [];
+  if (!Array.isArray(v)) throw new Error(`Invalid ${name}`);
   const out = [];
   for (const x of v) {
     if (typeof x === "string" && x.trim()) out.push(x.trim());
