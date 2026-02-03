@@ -16,26 +16,6 @@ const PR_BODY_EN_PATH = ".ai/PR_BODY.en.md";
 const LAST_OUTPUT_PATH = ".ai/last-output.txt";
 const GATES_LOG_PATH = ".ai/gates.log";
 
-// === Hard repo invariants / forbidden patterns ===
-// 이 레포 템플릿은 "기본 Vitest"만 가정.
-// React Testing Library / jest-dom / DOM matcher / __tests__ under app/* 는 금지.
-// (정말 필요하면 TASK에 명시하고, 템플릿 PR로 deps+config를 먼저 넣어야 함)
-const FORBIDDEN_DIFF_PATTERNS = [
-  // Testing Library stack
-  /@testing-library\/react/g,
-  /@testing-library\/jest-dom/g,
-  /@testing-library\/user-event/g,
-  /\btoBeInTheDocument\b/g,
-  /\brender\(/g,
-
-  // app router 쪽에서 __tests__ 만들지 않기 (typecheck/lint 파편화 방지)
-  /diff --git a\/app\/.*\/__tests__\/.* b\/app\/.*\/__tests__\/.*/g,
-
-  // 혹시 모르니 vitest config churn도 원천 차단
-  /diff --git a\/vitest\.config\.(ts|js|cjs|mjs) b\/vitest\.config\.(ts|js|cjs|mjs)/g,
-  /diff --git a\/vitest\.setup\.ts b\/vitest\.setup\.ts/g,
-];
-
 function mustEnv(name) {
   const v = process.env[name];
   if (!v) throw new Error(`Missing env: ${name}`);
@@ -74,10 +54,6 @@ async function cleanupArtifacts() {
   await rmIfExists(PR_BODY_PATH);
   await rmIfExists(PR_BODY_EN_PATH);
   await rmIfExists(LAST_OUTPUT_PATH);
-
-  // IMPORTANT: 아래는 "삭제 금지" (레포 고정 config 파일을 ai-run이 지우면 안 됨)
-  // await rmIfExists("vitest.config.ts");
-  // await rmIfExists("vitest.setup.ts");
 }
 
 function runCheck(cmd, args) {
@@ -93,11 +69,6 @@ function looksLikeUnifiedDiff(diff) {
   return hasDiffGit && hasMinus && hasPlus && hasHunk;
 }
 
-/**
- * Extract all fenced code blocks for a given language and pick the best candidate.
- * - For diff: pick the longest block (most content).
- * - For md: pick the first block (usually fine) but also allow longest fallback.
- */
 function extractAllCodeBlocks(text, lang) {
   const re = new RegExp("```" + lang + "\\n([\\s\\S]*?)\\n```", "gm");
   const blocks = [];
@@ -111,9 +82,7 @@ function extractAllCodeBlocks(text, lang) {
 function pickBestDiff(blocks) {
   if (!blocks.length) return null;
   let best = blocks[0];
-  for (const b of blocks) {
-    if (b.length > best.length) best = b;
-  }
+  for (const b of blocks) if (b.length > best.length) best = b;
   return best;
 }
 
@@ -121,20 +90,10 @@ function pickBestMd(blocks) {
   if (!blocks.length) return null;
   const first = blocks[0];
   let longest = first;
-  for (const b of blocks) {
-    if (b.length > longest.length) longest = b;
-  }
-  if (first.length >= 200) return first;
-  return longest;
+  for (const b of blocks) if (b.length > longest.length) longest = b;
+  return first.length >= 200 ? first : longest;
 }
 
-/**
- * Parse TASK.md for "Files to create" section.
- * Expected format:
- * ## Files to create
- * - path
- * - path
- */
 function parseRequiredFilesFromTask(taskText) {
   const lines = taskText.split("\n");
   const required = [];
@@ -142,22 +101,16 @@ function parseRequiredFilesFromTask(taskText) {
   let inSection = false;
   for (const raw of lines) {
     const line = raw.trim();
-
     if (/^##\s+Files to create\s*$/i.test(line)) {
       inSection = true;
       continue;
     }
-
-    // End section when another heading starts
     if (inSection && /^##\s+/.test(line)) break;
-
     if (!inSection) continue;
-
     const m = line.match(/^-\s+(.+)$/);
     if (m) required.push(m[1].trim());
   }
 
-  // Normalize: remove accidental markdown bold
   return required.map((p) => p.replace(/\*\*/g, ""));
 }
 
@@ -169,7 +122,6 @@ function mustIncludeRequiredFiles(diff, requiredPaths) {
     const header = `diff --git a/${p} b/${p}`;
     if (!diff.includes(header)) missing.push(p);
   }
-
   if (missing.length) {
     throw new Error(
       `Diff missing required files:\n- ${missing.join("\n- ")}\n` +
@@ -178,23 +130,61 @@ function mustIncludeRequiredFiles(diff, requiredPaths) {
   }
 }
 
+// ---- IMPORTANT: forbid patterns that repeatedly broke your gates
+const FORBIDDEN_DIFF_PATTERNS = [
+  {
+    re: /@testing-library\/react/g,
+    message:
+      "Do NOT introduce @testing-library/react. Repo does not have it and typecheck will fail.",
+  },
+  {
+    re: /@testing-library\/jest-dom/g,
+    message:
+      "Do NOT introduce @testing-library/jest-dom. Repo does not have it and typecheck will fail.",
+  },
+  {
+    re: /\btoBeInTheDocument\b/g,
+    message:
+      "Do NOT use toBeInTheDocument (jest-dom matcher). Use basic expect(...) or renderToString checks.",
+  },
+  {
+    re: /^diff --git a\/app\/.*\/__tests__\/.* b\/app\/.*\/__tests__\/.*/gm,
+    message:
+      "Do NOT create tests under app/**/__tests__ (Next app tests commonly require extra libs). Put tests under src/__tests__ instead.",
+  },
+  {
+    re: /^diff --git a\/vitest\.config\.(ts|js|cjs|mjs) b\/vitest\.config\.(ts|js|cjs|mjs)$/gm,
+    message:
+      "Do NOT create/modify vitest.config.ts/js/cjs/mjs. This repo uses vitest.config.mts (or existing config).",
+  },
+  {
+    re: /^diff --git a\/vitest\.setup\.ts b\/vitest\.setup\.ts$/gm,
+    message:
+      "Do NOT add vitest.setup.ts unless an existing vitest config already references it.",
+  },
+];
+
 function assertNoForbiddenDiff(diff) {
-  const hits = [];
-  for (const re of FORBIDDEN_DIFF_PATTERNS) {
-    re.lastIndex = 0;
-    if (re.test(diff)) hits.push(String(re));
+  for (const p of FORBIDDEN_DIFF_PATTERNS) {
+    if (p.re.test(diff)) {
+      throw new Error(`Forbidden diff content detected: ${p.message}`);
+    }
   }
-  if (hits.length) {
-    throw new Error(
-      [
-        "Forbidden patterns detected in generated diff.",
-        "This repo template does NOT allow RTL/jest-dom or app/**/__tests__ in AI runs.",
-        "Matched:",
-        ...hits.map((h) => `- ${h}`),
-        "",
-        "Regenerate WITHOUT those dependencies/patterns and avoid creating component tests.",
-      ].join("\n"),
-    );
+}
+
+function assertDoNotTouchUnlessTask({ diff, taskText, allowedPaths }) {
+  const protectedPaths = ["src/__tests__/smoke.test.ts"];
+  for (const p of protectedPaths) {
+    const header = `diff --git a/${p} b/${p}`;
+    if (!diff.includes(header)) continue;
+
+    const mentionedInTask = taskText.includes(p);
+    const allowed = allowedPaths.includes(p);
+    if (!mentionedInTask && !allowed) {
+      throw new Error(
+        `Do NOT modify ${p} unless TASK explicitly asks for it. Regenerate diff without touching ${p}.`,
+      );
+    }
   }
 }
 
@@ -214,7 +204,6 @@ async function anthropicMessagesCreate({
     max_tokens: maxTokens,
     messages: [{ role: "user", content: userText }],
   };
-
   if (system && String(system).trim()) body.system = system;
   if (temperature !== undefined) body.temperature = temperature;
 
@@ -251,7 +240,6 @@ async function translatePrBodyToKorean({ model, text }) {
     "Keep the Markdown structure and headings as-is.",
     "Do not add new content. Do not remove content.",
     "Preserve code spans/backticks, command names, filenames, and paths exactly.",
-    "If English technical terms are widely used (e.g., PR, lint, typecheck), you may keep them.",
     "Return ONLY the translated Markdown. No extra commentary.",
   ].join("\n");
 
@@ -312,31 +300,29 @@ async function callAgent({
     "1) One unified diff inside a single ```diff code block.",
     "2) One PR body inside a single ```md code block (Summary / How to test / Risk & rollback / Notes).",
     "Do not output any text outside the two fenced code blocks.",
-    "Do not include Markdown headings outside the ```md block.",
     "",
     "Hard requirements for the diff:",
     "- Must be valid `git diff` unified patch format: include `diff --git`, `---`, `+++`, and `@@` hunks.",
     "- Do NOT output header-only diffs. Every changed file must include at least one @@ hunk with real content.",
     "- If creating a new file, use `--- /dev/null` and `+++ b/<path>` and include at least one @@ hunk.",
-    "- Hunk headers must match the exact number of lines that follow.",
-    "- Every hunk line must start with ' ', '+', '-', or '\\\\' (no whitespace-only lines).",
     "",
     "Constraints:",
     "- Keep changes minimal; no large refactors, no mass formatting.",
     "- Do not add dependencies unless required by the task.",
     "- Changes must pass: pnpm test, pnpm lint, pnpm typecheck, pnpm format:check.",
+    "- Avoid `any` (eslint no-explicit-any). Use unknown + narrowing if needed.",
+    "",
+    "Testing constraints (IMPORTANT):",
+    "- Do NOT use @testing-library/react or jest-dom matchers.",
+    "- Do NOT create tests under app/**/__tests__.",
+    "- If you need to test a Next page/component, do it from src/__tests__ and use react-dom/server `renderToString` for basic smoke checks.",
     '- For Vitest test files, always import: `import { describe, it, expect } from "vitest";`',
-    "- Ensure every file is syntactically valid TypeScript (all braces/parens closed).",
     "",
-    "Repo invariants (hard):",
-    "- Do NOT create or modify any test runner config files unless TASK explicitly asks.",
-    "- Specifically: if vitest.config.mts exists, NEVER create vitest.config.ts (or vitest.config.js/cjs/mjs).",
-    "- Never add vitest.setup.ts unless an existing vitest config already references it.",
-    "",
-    "Testing policy (hard):",
-    "- Do NOT add @testing-library/* or jest-dom or DOM matchers (toBeInTheDocument).",
-    "- Do NOT create component tests under app/**/__tests__.",
-    "- If tests are needed, keep them as simple Vitest unit tests that do not require extra deps.",
+    "Repo invariants:",
+    "- Do NOT create or modify any vitest config files unless TASK explicitly asks.",
+    "- If vitest.config.mts exists, NEVER create vitest.config.ts/js/cjs/mjs.",
+    "- Never add vitest.setup.ts unless referenced by existing config.",
+    "- Do NOT modify src/__tests__/smoke.test.ts unless TASK explicitly asks.",
     "",
     requiredFilesRule,
     diffTemplate,
@@ -362,13 +348,11 @@ async function callAgent({
     );
   }
 
-  const input = inputParts.join("");
-
   const out = await anthropicMessagesCreate({
     apiKey: mustEnv("ANTHROPIC_API_KEY"),
     model,
     system: instructions,
-    userText: input,
+    userText: inputParts.join(""),
     maxTokens: maxOutputTokens,
     temperature,
   });
@@ -389,25 +373,27 @@ async function callAgent({
   if (!diff) throw new Error(`No diff block found. See ${LAST_OUTPUT_PATH}`);
   if (!prBodyEn)
     throw new Error(`No md PR body block found. See ${LAST_OUTPUT_PATH}`);
-
   if (!looksLikeUnifiedDiff(diff)) {
     throw new Error(
       `Invalid unified diff (missing headers or @@ hunk). See ${LAST_OUTPUT_PATH}`,
     );
   }
 
-  // === NEW: hard local guardrail ===
-  // 프롬프트가 안 지켜져도, 여기서 무조건 컷.
-  assertNoForbiddenDiff(diff);
-
-  // Ensure required files are included in the diff
+  // required files
   mustIncludeRequiredFiles(diff, requiredFiles);
 
-  await fs.writeFile(PATCH_PATH, diff + "\n", "utf8");
+  // hard guards
+  assertNoForbiddenDiff(diff);
+  assertDoNotTouchUnlessTask({
+    diff,
+    taskText: task,
+    allowedPaths: requiredFiles,
+  });
 
-  // PR body translation
+  await fs.writeFile(PATCH_PATH, diff + "\n", "utf8");
   await fs.writeFile(PR_BODY_EN_PATH, prBodyEn + "\n", "utf8");
 
+  // translate PR body
   const translateModel = readString("ANTHROPIC_TRANSLATE_MODEL", model);
   const koBody = await translatePrBodyToKorean({
     model: translateModel,
@@ -415,7 +401,7 @@ async function callAgent({
   });
   await fs.writeFile(PR_BODY_PATH, koBody + "\n", "utf8");
 
-  // Check applicability (more tolerant)
+  // check patch applicability
   const ok = runCheck("git", [
     "apply",
     "--check",
@@ -424,7 +410,6 @@ async function callAgent({
     "-p1",
     PATCH_PATH,
   ]);
-
   if (!ok) {
     throw new Error(
       `Generated patch is not applicable. See ${LAST_OUTPUT_PATH} and ${PATCH_PATH}`,
@@ -440,7 +425,7 @@ async function readGatesLog() {
   }
 }
 
-function tail(text, lines = 120) {
+function tail(text, lines = 160) {
   const arr = String(text || "").split("\n");
   return arr.slice(-lines).join("\n");
 }
@@ -485,9 +470,9 @@ async function main() {
               "Your previous output was invalid or failed quality gates.",
               "Regenerate a correct unified diff with full headers and at least one @@ hunk per file.",
               "Do not output header-only diffs (e.g., index ...e69de29).",
-              "Include ALL required files listed in the instructions.",
               "Fix issues reported in the gates log if provided.",
-              "Strictly follow Testing policy: no @testing-library/*, no jest-dom, no app/**/__tests__.",
+              "Reminder: no @testing-library/*, no toBeInTheDocument, no app/**/__tests__.",
+              "If you need a UI smoke test, put it under src/__tests__ and use react-dom/server renderToString.",
             ].join(" ");
 
       await cleanupArtifacts();
@@ -504,7 +489,7 @@ async function main() {
         previousOut,
       });
 
-      // (1) dry-run으로 적용+게이트 통과 여부 확인
+      // dry-run gates
       const dry = spawnSync(
         "node",
         ["scripts/ai-pr.mjs", branch, commitMsg, "--dry-run"],
@@ -518,7 +503,7 @@ async function main() {
         const gatesLog = await readGatesLog();
         const debug = [
           "# DRY_RUN_FAILED_GATES_LOG_TAIL",
-          tail(gatesLog, 200),
+          tail(gatesLog, 220),
         ].join("\n");
 
         try {
@@ -528,9 +513,8 @@ async function main() {
           previousOut = debug;
         }
 
-        if (attempt === 3) {
+        if (attempt === 3)
           throw new Error(`Dry-run failed. See ${GATES_LOG_PATH}`);
-        }
         continue;
       }
 
@@ -561,7 +545,6 @@ async function main() {
   );
   console.log("[ai:run] applying patch + creating PR...");
 
-  // (2) dry-run 통과한 경우에만 실제 PR 생성
   const prRes = spawnSync("node", ["scripts/ai-pr.mjs", branch, commitMsg], {
     stdio: "inherit",
     env: { ...process.env, AI_PR_BODY_FILE: PR_BODY_PATH },
