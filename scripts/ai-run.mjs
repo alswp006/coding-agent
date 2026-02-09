@@ -1,6 +1,7 @@
 import dotenv from "dotenv";
 import fs from "node:fs/promises";
 import { existsSync } from "node:fs";
+import path from "node:path";
 import { spawnSync } from "node:child_process";
 
 // Load env files (prefer .env.local)
@@ -43,9 +44,9 @@ function readString(name, fallback) {
   return v && String(v).trim() ? String(v).trim() : fallback;
 }
 
-async function rmIfExists(path) {
+async function rmIfExists(p) {
   try {
-    await fs.rm(path, { force: true, recursive: false });
+    await fs.rm(p, { force: true, recursive: false });
   } catch {
     // ignore
   }
@@ -87,6 +88,7 @@ function extractAllCodeBlocks(text, lang) {
 
 function pickBestDiff(blocks) {
   if (!blocks.length) return null;
+  // 가장 긴 diff를 선택 (대체로 완성본일 확률 높음)
   let best = blocks[0];
   for (const b of blocks) if (b.length > best.length) best = b;
   return best;
@@ -184,7 +186,7 @@ function assertPatchPolicy({
       /^diff --git a\/app\/drafts\/.*__tests__\/.* b\/app\/drafts\/.*__tests__\/.*/m;
     if (re.test(diff)) {
       throw new Error(
-        `Policy violation: tests under app/drafts/**/__tests__ are not allowed (breaks typecheck/lint due to missing deps).`,
+        `Policy violation: tests under app/drafts/**/__tests__ are not allowed.`,
       );
     }
   }
@@ -227,7 +229,7 @@ const FORBIDDEN_DIFF_PATTERNS = [
   {
     re: /^diff --git a\/app\/.*\/__tests__\/.* b\/app\/.*\/__tests__\/.*/m,
     message:
-      "Do NOT create tests under app/**/__tests__. Put tests under src/__tests__ instead.",
+      "Do NOT create tests under app/**/__tests__. Put tests under src/**/__tests__ instead.",
   },
   {
     re: /^diff --git a\/vitest\.config\.(ts|js|cjs|mjs) b\/vitest\.config\.(ts|js|cjs|mjs)$/m,
@@ -250,7 +252,6 @@ function assertNoForbiddenDiff(diff) {
 }
 
 function assertDoNotTouchUnlessTask({ diff, taskText, allowedPaths }) {
-  // 보호 파일: 코더가 괜히 건드리면 patch apply conflict / 의미 없는 변경이 자주 발생
   const protectedPaths = ["src/__tests__/smoke.test.ts"];
 
   for (const p of protectedPaths) {
@@ -266,6 +267,101 @@ function assertDoNotTouchUnlessTask({ diff, taskText, allowedPaths }) {
       );
     }
   }
+}
+
+// -----------------------------
+// Repo snapshot helpers (patch applicability booster)
+// -----------------------------
+
+async function safeReadFile(p, maxBytes = 40_000) {
+  try {
+    const buf = await fs.readFile(p);
+    if (buf.length > maxBytes) {
+      return buf.slice(0, maxBytes).toString("utf8") + "\n\n[TRUNCATED]\n";
+    }
+    return buf.toString("utf8");
+  } catch {
+    return null;
+  }
+}
+
+function isProbablyTextFile(p) {
+  const ext = path.extname(p).toLowerCase();
+  // 필요한 확장만 선별 (너무 많이 넣으면 프롬프트 비대화)
+  return [
+    ".ts",
+    ".tsx",
+    ".js",
+    ".jsx",
+    ".mts",
+    ".cts",
+    ".json",
+    ".md",
+    ".yml",
+    ".yaml",
+    ".css",
+  ].includes(ext);
+}
+
+async function buildRepoSnapshot(requiredFiles) {
+  // "패치 적용성"에 직접 영향 큰 파일을 우선 제공
+  const candidates = new Set([
+    "app/page.tsx",
+    "app/layout.tsx",
+    "app/drafts/new/page.tsx",
+    "src/domain/draft.ts",
+    "src/domain/buildDraftState.ts",
+    "src/domain/draftForm.ts",
+    "src/domain/draftFieldNames.ts",
+    "src/domain/__tests__/draft.test.ts",
+    "src/domain/__tests__/buildDraftState.test.ts",
+    "src/__tests__/smoke.test.ts",
+    "package.json",
+    "tsconfig.json",
+    "vitest.config.mts",
+  ]);
+
+  for (const p of requiredFiles) candidates.add(p);
+
+  const parts = [];
+  for (const p of Array.from(candidates)) {
+    if (!existsSync(p)) continue;
+    if (!isProbablyTextFile(p)) continue;
+    const content = await safeReadFile(p);
+    if (!content) continue;
+    parts.push(`## FILE: ${p}\n\`\`\`\n${content.trimEnd()}\n\`\`\``);
+  }
+
+  return parts.length ? parts.join("\n\n") : "(no snapshot files captured)";
+}
+
+function parseFailedPathsFromGitApply(stderrText) {
+  const s = String(stderrText || "");
+  const paths = new Set();
+
+  // 대표 케이스:
+  // "error: patch failed: app/page.tsx:1"
+  // "error: app/page.tsx: patch does not apply"
+  const re1 = /patch failed:\s+([^\s:]+):\d+/g;
+  const re2 = /error:\s+([^\s:]+):\s+patch does not apply/g;
+
+  let m;
+  while ((m = re1.exec(s)) !== null) paths.add(m[1]);
+  while ((m = re2.exec(s)) !== null) paths.add(m[1]);
+
+  return Array.from(paths);
+}
+
+async function buildFailureSnapshot(failedPaths) {
+  const parts = [];
+  for (const p of failedPaths) {
+    if (!p) continue;
+    if (!existsSync(p)) continue;
+    const content = await safeReadFile(p, 80_000);
+    if (!content) continue;
+    parts.push(`## FAILED_FILE: ${p}\n\`\`\`\n${content.trimEnd()}\n\`\`\``);
+  }
+  return parts.length ? parts.join("\n\n") : "";
 }
 
 // -----------------------------
@@ -324,8 +420,6 @@ async function openaiResponsesCreate({
   system,
   userText,
   maxTokens,
-  // NOTE: DO NOT accept or forward "temperature" here.
-  // Some models reject it and will 400.
 }) {
   const body = {
     model,
@@ -403,6 +497,8 @@ async function callAgent({
   extraRules,
   attempt,
   previousOut,
+  repoSnapshot,
+  failureSnapshot,
 }) {
   const diffTemplate = [
     "Here is a minimal valid example of a NEW FILE diff. Follow this format exactly:",
@@ -418,8 +514,9 @@ async function callAgent({
     "+}",
     "```",
     "",
-    "Important: Your diff must include `---`, `+++`, and at least one `@@` hunk with real lines.",
-    "Do NOT output header-only diffs like index ...e69de29.",
+    "Important:",
+    "- Output ONE diff block only. Do NOT repeat files or include duplicate diff sections.",
+    "- Each changed file must include `---`, `+++`, and at least one `@@` hunk with real lines.",
   ].join("\n");
 
   const requiredFilesRule = requiredFiles.length
@@ -439,8 +536,9 @@ async function callAgent({
     "",
     "Hard requirements for the diff:",
     "- Must be valid `git diff` unified patch format: include `diff --git`, `---`, `+++`, and `@@` hunks.",
-    "- Do NOT output header-only diffs. Every changed file must include at least one @@ hunk with real content.",
-    "- If creating a new file, use `--- /dev/null` and `+++ b/<path>` and include at least one @@ hunk.",
+    "- Output ONE diff block only. No duplicate `diff --git` for same file.",
+    "- Do NOT delete+recreate the same file in two separate diff entries.",
+    "- Prefer small, minimal hunks. Do NOT replace entire files unless TASK requires.",
     "",
     "Constraints:",
     "- Keep changes minimal; no large refactors, no mass formatting.",
@@ -472,9 +570,18 @@ async function callAgent({
     bundle,
     "\n\n# TASK\n",
     task,
-    "\n\n# ATTEMPT\n",
-    String(attempt),
+    "\n\n# REPO_SNAPSHOT (current files; generate diffs against this)\n",
+    repoSnapshot || "(no snapshot)",
   ];
+
+  if (failureSnapshot && String(failureSnapshot).trim()) {
+    inputParts.push(
+      "\n\n# PATCH_APPLY_FAILURE_CONTEXT (files that failed to apply; use these exact current contents)\n",
+      failureSnapshot,
+    );
+  }
+
+  inputParts.push("\n\n# ATTEMPT\n", String(attempt));
 
   if (previousOut) {
     inputParts.push(
@@ -493,7 +600,6 @@ async function callAgent({
       system: instructions,
       userText,
       maxTokens: maxOutputTokens,
-      // IMPORTANT: do not pass temperature
     });
   } else {
     out = await anthropicMessagesCreate({
@@ -571,8 +677,12 @@ async function callAgent({
   if (chk.status !== 0) {
     const debug = `\n\n# GIT_APPLY_CHECK_FAILED\n${chk.stderr}\n`;
     await fs.writeFile(LAST_OUTPUT_PATH, out + debug, "utf8");
+    const failed = parseFailedPathsFromGitApply(chk.stderr);
+    const failedList = failed.length
+      ? `\nFailed paths:\n- ${failed.join("\n- ")}`
+      : "";
     throw new Error(
-      `Generated patch is not applicable. See ${LAST_OUTPUT_PATH} and ${PATCH_PATH}`,
+      `Generated patch is not applicable. See ${LAST_OUTPUT_PATH} and ${PATCH_PATH}${failedList}`,
     );
   }
 }
@@ -619,11 +729,14 @@ async function main() {
   const claudeModel = readString("ANTHROPIC_MODEL", "claude-sonnet-4-5");
 
   // Tokens/temperature knobs
-  const maxOutputTokens = readNumber("ANTHROPIC_MAX_OUTPUT_TOKENS", 2200);
+  const maxOutputTokens = readNumber("AI_MAX_OUTPUT_TOKENS", 2200);
   const temperature = readOptionalNumber("ANTHROPIC_TEMPERATURE");
 
   let previousOut = "";
+  let failureSnapshot = "";
   let success = false;
+
+  const repoSnapshot = await buildRepoSnapshot(requiredFiles);
 
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
@@ -645,9 +758,10 @@ async function main() {
           : [
               "Your previous output was invalid or failed quality gates.",
               "Regenerate a correct unified diff with full headers and at least one @@ hunk per file.",
-              "Do not output header-only diffs (e.g., index ...e69de29).",
-              "Fix issues reported in the gates log if provided.",
+              "Output ONE diff block only. No duplicate file diffs.",
+              "Prefer minimal hunks; do not replace whole files unless required.",
               "Reminder: no @testing-library/*, no toBeInTheDocument, no app/**/__tests__.",
+              "Most important: the patch MUST apply cleanly to the provided REPO_SNAPSHOT.",
             ].join(" ");
 
       await cleanupArtifacts();
@@ -663,6 +777,8 @@ async function main() {
         extraRules,
         attempt,
         previousOut,
+        repoSnapshot,
+        failureSnapshot,
       });
 
       // dry-run gates
@@ -697,13 +813,39 @@ async function main() {
       success = true;
       break;
     } catch (e) {
-      console.error(`[ai:run] attempt ${attempt} failed:`, e?.message || e);
+      const msg = e?.message || String(e || "");
+      console.error(`[ai:run] attempt ${attempt} failed:`, msg);
 
       try {
         const last = await fs.readFile(LAST_OUTPUT_PATH, "utf8");
         previousOut = last;
       } catch {
         // ignore
+      }
+
+      // apply-check 실패면, 실패 파일 스냅샷을 만들어 다음 시도에 붙인다
+      if (msg.includes("Generated patch is not applicable")) {
+        // patch.diff는 이미 만들어져 있을 수 있음. stderr는 last-output에 tail로 들어가있음.
+        const last = await fs
+          .readFile(LAST_OUTPUT_PATH, "utf8")
+          .catch(() => "");
+        const failedPaths = parseFailedPathsFromGitApply(last);
+        if (failedPaths.length) {
+          failureSnapshot = await buildFailureSnapshot(failedPaths);
+        } else {
+          // fallback: git apply --check stderr를 직접 재실행해서 파싱
+          const chk = runCapture("git", [
+            "apply",
+            "--check",
+            "--recount",
+            "--whitespace=nowarn",
+            "-p1",
+            PATCH_PATH,
+          ]);
+          const paths2 = parseFailedPathsFromGitApply(chk.stderr);
+          if (paths2.length)
+            failureSnapshot = await buildFailureSnapshot(paths2);
+        }
       }
 
       if (attempt === 3) throw e;
