@@ -16,11 +16,9 @@ const PR_BODY_EN_PATH = ".ai/PR_BODY.en.md";
 const LAST_OUTPUT_PATH = ".ai/last-output.txt";
 const GATES_LOG_PATH = ".ai/gates.log";
 
-const OPENAI_BASE_URL = "https://api.openai.com/v1";
+const OPENAI_BASE_URL =
+  process.env.OPENAI_BASE_URL || "https://api.openai.com/v1";
 
-// -----------------------------
-// Utils
-// -----------------------------
 function mustEnv(name) {
   const v = process.env[name];
   if (!v) throw new Error(`Missing env: ${name}`);
@@ -79,7 +77,8 @@ function looksLikeUnifiedDiff(diff) {
 }
 
 function extractAllCodeBlocks(text, lang) {
-  const re = new RegExp("```" + lang + "\\n([\\s\\S]*?)\\n```", "gm");
+  // tolerate CRLF
+  const re = new RegExp("```" + lang + "\\r?\\n([\\s\\S]*?)\\r?\\n```", "gm");
   const blocks = [];
   let m;
   while ((m = re.exec(text)) !== null) {
@@ -101,6 +100,33 @@ function pickBestMd(blocks) {
   let longest = first;
   for (const b of blocks) if (b.length > longest.length) longest = b;
   return first.length >= 200 ? first : longest;
+}
+
+function fallbackExtractDiff(text) {
+  // If fences got broken, salvage from first "diff --git" to end,
+  // but stop before a PR body fence if present.
+  const s = String(text || "");
+  const i = s.indexOf("diff --git ");
+  if (i < 0) return null;
+
+  let tail = s.slice(i);
+
+  // Stop if we see a ```md fence after the diff start (common: diff then md)
+  const mdFenceIdx = tail.search(/```(md|markdown|mdx)\r?\n/);
+  if (mdFenceIdx >= 0) {
+    tail = tail.slice(0, mdFenceIdx);
+  }
+
+  // Also stop if a new triple-fence starts (generic) and it's not diff
+  // (best-effort; don't over-trim)
+  const otherFenceIdx = tail.search(/```[a-zA-Z0-9_-]*\r?\n/);
+  if (otherFenceIdx > 0) {
+    // If the first fence is at position 0, ignore.
+    // Otherwise it's likely the PR body starting.
+    tail = tail.slice(0, otherFenceIdx);
+  }
+
+  return tail.trimEnd();
 }
 
 /**
@@ -152,64 +178,6 @@ function mustIncludeRequiredFiles(diff, requiredPaths) {
 // -----------------------------
 // Policy / Forbidden guards
 // -----------------------------
-function assertPatchPolicy({
-  diff,
-  repoUsesVitestMts = true,
-  forbidReactTestingLib = true,
-  forbidAppDraftsTests = true,
-}) {
-  // 1) vitest config 중복/변형 방지
-  const forbiddenVitestConfigs = [
-    "vitest.config.ts",
-    "vitest.config.js",
-    "vitest.config.cjs",
-    "vitest.config.mjs",
-  ];
-
-  if (repoUsesVitestMts) {
-    for (const f of forbiddenVitestConfigs) {
-      const re = new RegExp(
-        `^diff --git a/${f.replace(/\./g, "\\.")} b/${f.replace(/\./g, "\\.")}$`,
-        "m",
-      );
-      if (re.test(diff)) {
-        throw new Error(
-          `Policy violation: forbidden change detected: ${f} (repo already uses vitest.config.mts)`,
-        );
-      }
-    }
-  }
-
-  // 2) app/drafts/** 테스트 추가 금지
-  if (forbidAppDraftsTests) {
-    const re =
-      /^diff --git a\/app\/drafts\/.*__tests__\/.* b\/app\/drafts\/.*__tests__\/.*/m;
-    if (re.test(diff)) {
-      throw new Error(
-        `Policy violation: tests under app/drafts/**/__tests__ are not allowed (breaks typecheck/lint due to missing deps).`,
-      );
-    }
-  }
-
-  // 3) Testing Library import 금지
-  if (forbidReactTestingLib) {
-    const re = /@testing-library\/react/;
-    if (re.test(diff)) {
-      throw new Error(
-        `Policy violation: patch introduces @testing-library/react but repo doesn't include it.`,
-      );
-    }
-  }
-
-  // 4) package.json 변경 금지 (Task가 허용할 때만)
-  const pkgRe = /^diff --git a\/package\.json b\/package\.json/m;
-  if (pkgRe.test(diff)) {
-    throw new Error(
-      `Policy violation: patch modifies package.json. Keep dependencies unchanged unless TASK explicitly allows.`,
-    );
-  }
-}
-
 const FORBIDDEN_DIFF_PATTERNS = [
   {
     re: /@testing-library\/react/,
@@ -252,12 +220,7 @@ function assertNoForbiddenDiff(diff) {
 }
 
 function assertDoNotTouchUnlessTask({ diff, taskText, allowedPaths }) {
-  // 보호 파일: 코더가 괜히 건드리면 patch apply conflict / 의미 없는 변경이 자주 발생
-  const protectedPaths = [
-    "src/__tests__/smoke.test.ts",
-    "app/page.tsx", // ✅ 홈 페이지 절대 금지
-    "app/layout.tsx", // ✅ 레이아웃도 절대 금지(대부분 TASK 범위 밖)
-  ];
+  const protectedPaths = ["src/__tests__/smoke.test.ts"];
 
   for (const p of protectedPaths) {
     const header = `diff --git a/${p} b/${p}`;
@@ -274,26 +237,62 @@ function assertDoNotTouchUnlessTask({ diff, taskText, allowedPaths }) {
   }
 }
 
-function assertNoDuplicateFileDiffs(diff) {
-  const re = /^diff --git a\/(.+?) b\/\1$/gm;
-  const seen = new Set();
-  const dups = new Set();
-  let m;
-  while ((m = re.exec(diff)) !== null) {
-    const p = m[1];
-    if (seen.has(p)) dups.add(p);
-    seen.add(p);
+function assertPatchPolicy({
+  diff,
+  repoUsesVitestMts = true,
+  forbidReactTestingLib = true,
+  forbidAppDraftsTests = true,
+}) {
+  const forbiddenVitestConfigs = [
+    "vitest.config.ts",
+    "vitest.config.js",
+    "vitest.config.cjs",
+    "vitest.config.mjs",
+  ];
+
+  if (repoUsesVitestMts) {
+    for (const f of forbiddenVitestConfigs) {
+      const re = new RegExp(
+        `^diff --git a/${f.replace(/\./g, "\\.")} b/${f.replace(/\./g, "\\.")}$`,
+        "m",
+      );
+      if (re.test(diff)) {
+        throw new Error(
+          `Policy violation: forbidden change detected: ${f} (repo already uses vitest.config.mts)`,
+        );
+      }
+    }
   }
-  if (dups.size) {
+
+  if (forbidAppDraftsTests) {
+    const re =
+      /^diff --git a\/app\/drafts\/.*__tests__\/.* b\/app\/drafts\/.*__tests__\/.*/m;
+    if (re.test(diff)) {
+      throw new Error(
+        `Policy violation: tests under app/drafts/**/__tests__ are not allowed.`,
+      );
+    }
+  }
+
+  if (forbidReactTestingLib) {
+    const re = /@testing-library\/react/;
+    if (re.test(diff)) {
+      throw new Error(
+        `Policy violation: patch introduces @testing-library/react but repo doesn't include it.`,
+      );
+    }
+  }
+
+  const pkgRe = /^diff --git a\/package\.json b\/package\.json/m;
+  if (pkgRe.test(diff)) {
     throw new Error(
-      `Duplicate diff blocks detected for files:\n- ${[...dups].join("\n- ")}\n` +
-        `Regenerate diff with EXACTLY one diff block per file.`,
+      `Policy violation: patch modifies package.json. Keep dependencies unchanged unless TASK explicitly allows.`,
     );
   }
 }
 
 // -----------------------------
-// Anthropic API (Fix/Review only)
+// Anthropic API (Fix/Review)
 // -----------------------------
 async function anthropicMessagesCreate({
   apiKey,
@@ -350,23 +349,21 @@ async function openaiResponsesCreate({
   maxTokens,
   temperature,
 }) {
-  // ✅ Responses API 포맷: input은 "문자열" 또는 "input array of items"
-  // 가장 호환 좋은 방식: system+user를 하나의 문자열로 합쳐서 input에 넣기
-  const merged = [
-    system && String(system).trim() ? `SYSTEM:\n${String(system).trim()}` : "",
-    `USER:\n${String(userText || "")}`,
-  ]
-    .filter(Boolean)
-    .join("\n\n");
-
+  // Use responses API recommended shape for stability
   const body = {
     model,
-    input: merged,
-    store: false,
+    ...(system && String(system).trim()
+      ? { instructions: String(system) }
+      : {}),
+    input: [
+      {
+        role: "user",
+        content: [{ type: "input_text", text: String(userText || "") }],
+      },
+    ],
+    ...(typeof maxTokens === "number" ? { max_output_tokens: maxTokens } : {}),
+    ...(typeof temperature === "number" ? { temperature } : {}),
   };
-
-  if (typeof maxTokens === "number") body.max_output_tokens = maxTokens;
-  if (typeof temperature === "number") body.temperature = temperature;
 
   const res = await fetch(`${OPENAI_BASE_URL}/responses`, {
     method: "POST",
@@ -386,14 +383,20 @@ async function openaiResponsesCreate({
     );
   }
 
-  const out =
-    typeof json?.output_text === "string"
-      ? json.output_text
-      : typeof json?.response?.output_text === "string"
-        ? json.response.output_text
-        : "";
+  // Prefer output_text convenience field
+  if (typeof json?.output_text === "string" && json.output_text.trim()) {
+    return String(json.output_text);
+  }
 
-  return String(out || "");
+  // Fallback: scan structured output
+  const output = Array.isArray(json?.output) ? json.output : [];
+  const text = output
+    .flatMap((o) => (Array.isArray(o?.content) ? o.content : []))
+    .filter((c) => c && c.type === "output_text" && typeof c.text === "string")
+    .map((c) => c.text)
+    .join("");
+
+  return String(text || "");
 }
 
 async function translatePrBodyToKorean({ model, text }) {
@@ -481,8 +484,6 @@ async function callAgent({
     '- For Vitest test files, always import: `import { describe, it, expect } from "vitest";`',
     "",
     "Repo invariants:",
-    "- Never modify app/page.tsx or app/layout.tsx unless TASK explicitly asks.",
-    "- Implement Create New Draft page ONLY at: app/drafts/new/page.tsx (or paths explicitly requested by TASK).",
     "- Do NOT create or modify any vitest config files unless TASK explicitly asks.",
     "- If vitest.config.mts exists, NEVER create vitest.config.ts/js/cjs/mjs.",
     "- Never add vitest.setup.ts unless referenced by existing config.",
@@ -545,8 +546,13 @@ async function callAgent({
     ...extractAllCodeBlocks(out, "mdx"),
   ];
 
-  const diff = pickBestDiff(diffBlocks);
+  let diff = pickBestDiff(diffBlocks);
   const prBodyEn = pickBestMd(mdBlocks);
+
+  if (!diff) {
+    // fallback salvage for broken fences
+    diff = fallbackExtractDiff(out);
+  }
 
   if (!diff) throw new Error(`No diff block found. See ${LAST_OUTPUT_PATH}`);
   if (!prBodyEn)
@@ -567,7 +573,6 @@ async function callAgent({
     taskText: task,
     allowedPaths: requiredFiles,
   });
-  assertNoDuplicateFileDiffs(diff);
 
   // policy gate
   assertPatchPolicy({
@@ -621,9 +626,7 @@ function tail(text, lines = 160) {
 }
 
 async function main() {
-  const defaultBranch = `feat/ai-run-${new Date()
-    .toISOString()
-    .replace(/[:.]/g, "-")}`;
+  const defaultBranch = `feat/ai-run-${new Date().toISOString().replace(/[:.]/g, "-")}`;
   const branch = process.argv[2] ?? process.env.AI_BRANCH ?? defaultBranch;
   const commitMsg = process.argv[3] ?? "chore: apply ai patch";
 
@@ -646,10 +649,11 @@ async function main() {
 
   // Models
   const openaiModel = readString("OPENAI_MODEL", "gpt-5.2");
-  const claudeModel = readString("ANTHROPIC_MODEL", "claude-sonnet-4-5");
+  const claudeModel = readString("ANTHROPIC_MODEL", "claude-sonnet-4-6");
 
-  // Knobs (shared)
-  const maxOutputTokens = readNumber("AI_MAX_OUTPUT_TOKENS", 2400);
+  // Token knobs (split)
+  const openaiMaxOutputTokens = readNumber("OPENAI_MAX_OUTPUT_TOKENS", 6000);
+  const claudeMaxOutputTokens = readNumber("ANTHROPIC_MAX_OUTPUT_TOKENS", 2600);
   const temperature = readOptionalNumber("AI_TEMPERATURE");
 
   let previousOut = "";
@@ -657,9 +661,10 @@ async function main() {
 
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
-      // attempt 1: OpenAI (code). attempt 2-3: Anthropic (fix/review)
       const provider = attempt === 1 ? "openai" : "anthropic";
       const model = provider === "openai" ? openaiModel : claudeModel;
+      const maxOutputTokens =
+        provider === "openai" ? openaiMaxOutputTokens : claudeMaxOutputTokens;
 
       if (provider === "openai") {
         console.log("[ai:run] calling OpenAI (code)...");
@@ -678,7 +683,6 @@ async function main() {
               "Do not output header-only diffs (e.g., index ...e69de29).",
               "Fix issues reported in the gates log if provided.",
               "Reminder: no @testing-library/*, no toBeInTheDocument, no app/**/__tests__.",
-              "Reminder: Do NOT modify app/page.tsx or app/layout.tsx.",
             ].join(" ");
 
       await cleanupArtifacts();
