@@ -18,6 +18,9 @@ const GATES_LOG_PATH = ".ai/gates.log";
 
 const OPENAI_BASE_URL = "https://api.openai.com/v1";
 
+// -----------------------------
+// Utils
+// -----------------------------
 function mustEnv(name) {
   const v = process.env[name];
   if (!v) throw new Error(`Missing env: ${name}`);
@@ -149,7 +152,6 @@ function mustIncludeRequiredFiles(diff, requiredPaths) {
 // -----------------------------
 // Policy / Forbidden guards
 // -----------------------------
-
 function assertPatchPolicy({
   diff,
   repoUsesVitestMts = true,
@@ -251,7 +253,11 @@ function assertNoForbiddenDiff(diff) {
 
 function assertDoNotTouchUnlessTask({ diff, taskText, allowedPaths }) {
   // 보호 파일: 코더가 괜히 건드리면 patch apply conflict / 의미 없는 변경이 자주 발생
-  const protectedPaths = ["src/__tests__/smoke.test.ts"];
+  const protectedPaths = [
+    "src/__tests__/smoke.test.ts",
+    "app/page.tsx", // ✅ 홈 페이지 절대 금지
+    "app/layout.tsx", // ✅ 레이아웃도 절대 금지(대부분 TASK 범위 밖)
+  ];
 
   for (const p of protectedPaths) {
     const header = `diff --git a/${p} b/${p}`;
@@ -265,6 +271,24 @@ function assertDoNotTouchUnlessTask({ diff, taskText, allowedPaths }) {
         `Do NOT modify ${p} unless TASK explicitly asks for it. Regenerate diff without touching ${p}.`,
       );
     }
+  }
+}
+
+function assertNoDuplicateFileDiffs(diff) {
+  const re = /^diff --git a\/(.+?) b\/\1$/gm;
+  const seen = new Set();
+  const dups = new Set();
+  let m;
+  while ((m = re.exec(diff)) !== null) {
+    const p = m[1];
+    if (seen.has(p)) dups.add(p);
+    seen.add(p);
+  }
+  if (dups.size) {
+    throw new Error(
+      `Duplicate diff blocks detected for files:\n- ${[...dups].join("\n- ")}\n` +
+        `Regenerate diff with EXACTLY one diff block per file.`,
+    );
   }
 }
 
@@ -326,14 +350,19 @@ async function openaiResponsesCreate({
   maxTokens,
   temperature,
 }) {
+  // ✅ Responses API 포맷: input은 "문자열" 또는 "input array of items"
+  // 가장 호환 좋은 방식: system+user를 하나의 문자열로 합쳐서 input에 넣기
+  const merged = [
+    system && String(system).trim() ? `SYSTEM:\n${String(system).trim()}` : "",
+    `USER:\n${String(userText || "")}`,
+  ]
+    .filter(Boolean)
+    .join("\n\n");
+
   const body = {
     model,
-    input: [
-      ...(system && String(system).trim()
-        ? [{ role: "system", content: String(system) }]
-        : []),
-      { role: "user", content: String(userText || "") },
-    ],
+    input: merged,
+    store: false,
   };
 
   if (typeof maxTokens === "number") body.max_output_tokens = maxTokens;
@@ -357,17 +386,14 @@ async function openaiResponsesCreate({
     );
   }
 
-  const output = Array.isArray(json?.output) ? json.output : [];
-  const text = output
-    .flatMap((o) => (Array.isArray(o?.content) ? o.content : []))
-    .filter((c) => c && c.type === "output_text" && typeof c.text === "string")
-    .map((c) => c.text)
-    .join("");
+  const out =
+    typeof json?.output_text === "string"
+      ? json.output_text
+      : typeof json?.response?.output_text === "string"
+        ? json.response.output_text
+        : "";
 
-  const fallbackText =
-    typeof json?.output_text === "string" ? json.output_text : "";
-
-  return String(text || fallbackText || "");
+  return String(out || "");
 }
 
 async function translatePrBodyToKorean({ model, text }) {
@@ -455,6 +481,8 @@ async function callAgent({
     '- For Vitest test files, always import: `import { describe, it, expect } from "vitest";`',
     "",
     "Repo invariants:",
+    "- Never modify app/page.tsx or app/layout.tsx unless TASK explicitly asks.",
+    "- Implement Create New Draft page ONLY at: app/drafts/new/page.tsx (or paths explicitly requested by TASK).",
     "- Do NOT create or modify any vitest config files unless TASK explicitly asks.",
     "- If vitest.config.mts exists, NEVER create vitest.config.ts/js/cjs/mjs.",
     "- Never add vitest.setup.ts unless referenced by existing config.",
@@ -539,6 +567,7 @@ async function callAgent({
     taskText: task,
     allowedPaths: requiredFiles,
   });
+  assertNoDuplicateFileDiffs(diff);
 
   // policy gate
   assertPatchPolicy({
@@ -559,32 +588,18 @@ async function callAgent({
   });
   await fs.writeFile(PR_BODY_PATH, koBody + "\n", "utf8");
 
-  // check patch applicability (capture reason if fails)
+  // check patch applicability
   const chk = runCapture("git", [
     "apply",
-    " --check",
+    "--check",
     "--recount",
     "--whitespace=nowarn",
     "-p1",
     PATCH_PATH,
   ]);
 
-  // NOTE: some shells/users accidentally introduce a leading space in args;
-  // keep a second check without that just in case.
-  const chk2 =
-    chk.status === 0
-      ? chk
-      : runCapture("git", [
-          "apply",
-          "--check",
-          "--recount",
-          "--whitespace=nowarn",
-          "-p1",
-          PATCH_PATH,
-        ]);
-
-  if (chk2.status !== 0) {
-    const debug = `\n\n# GIT_APPLY_CHECK_FAILED\n${chk2.stderr}\n`;
+  if (chk.status !== 0) {
+    const debug = `\n\n# GIT_APPLY_CHECK_FAILED\n${chk.stderr}\n`;
     await fs.writeFile(LAST_OUTPUT_PATH, out + debug, "utf8");
     throw new Error(
       `Generated patch is not applicable. See ${LAST_OUTPUT_PATH} and ${PATCH_PATH}`,
@@ -606,7 +621,9 @@ function tail(text, lines = 160) {
 }
 
 async function main() {
-  const defaultBranch = `feat/ai-run-${new Date().toISOString().replace(/[:.]/g, "-")}`;
+  const defaultBranch = `feat/ai-run-${new Date()
+    .toISOString()
+    .replace(/[:.]/g, "-")}`;
   const branch = process.argv[2] ?? process.env.AI_BRANCH ?? defaultBranch;
   const commitMsg = process.argv[3] ?? "chore: apply ai patch";
 
@@ -631,9 +648,9 @@ async function main() {
   const openaiModel = readString("OPENAI_MODEL", "gpt-5.2");
   const claudeModel = readString("ANTHROPIC_MODEL", "claude-sonnet-4-5");
 
-  // Keep these knobs for now (shared)
-  const maxOutputTokens = readNumber("ANTHROPIC_MAX_OUTPUT_TOKENS", 2200);
-  const temperature = readOptionalNumber("ANTHROPIC_TEMPERATURE");
+  // Knobs (shared)
+  const maxOutputTokens = readNumber("AI_MAX_OUTPUT_TOKENS", 2400);
+  const temperature = readOptionalNumber("AI_TEMPERATURE");
 
   let previousOut = "";
   let success = false;
@@ -661,6 +678,7 @@ async function main() {
               "Do not output header-only diffs (e.g., index ...e69de29).",
               "Fix issues reported in the gates log if provided.",
               "Reminder: no @testing-library/*, no toBeInTheDocument, no app/**/__tests__.",
+              "Reminder: Do NOT modify app/page.tsx or app/layout.tsx.",
             ].join(" ");
 
       await cleanupArtifacts();
