@@ -253,12 +253,7 @@ function salvagePrBody(rawOutput, task) {
  * with the bad output, asking it to re-emit just the two code blocks.
  * Returns the repaired output text, or null if repair also fails.
  */
-async function openaiFormatRepair({
-  apiKey,
-  model,
-  badOutput,
-  maxTokens,
-}) {
+async function openaiFormatRepair({ apiKey, model, badOutput, maxTokens }) {
   const repairPrompt = [
     "Your previous output did not follow the required format.",
     "I need EXACTLY two fenced code blocks and nothing else:",
@@ -307,7 +302,7 @@ function tryGitApply(patchPath) {
   const strategies = [
     ["--check", "--recount", "--whitespace=nowarn", "-p1"],
     ["--check", "--recount", "--whitespace=fix", "-p1"],
-    ["--check", "--recount", "--whitespace=nowarn", "-p1", "-C1"],  // reduce context requirement
+    ["--check", "--recount", "--whitespace=nowarn", "-p1", "-C1"], // reduce context requirement
   ];
 
   for (const args of strategies) {
@@ -336,7 +331,10 @@ function tryGitApply(patchPath) {
 /**
  * Extract all "+"-prefixed lines (new code) from a unified diff
  * for files with .tsx/.jsx extension, then do a basic bracket/tag balance check.
- * This catches obvious truncation before we even try git apply.
+ *
+ * IMPORTANT: Only perform hard validation on NEW files (new file mode 100644)
+ * where the entire file content is in the diff. For modification diffs,
+ * added lines are just a subset — missing closing tags are in the existing file.
  */
 function validateDiffSyntax(diff) {
   // Parse diff into per-file chunks
@@ -350,6 +348,12 @@ function validateDiffSyntax(diff) {
     // Only check TSX/JSX files (most common source of tag mismatch)
     if (!/\.[tj]sx$/.test(filePath)) continue;
 
+    const isNewFile = /^new file mode/m.test(chunk);
+
+    // For modification diffs, skip syntax validation — added lines are
+    // only a partial view and will naturally appear imbalanced.
+    if (!isNewFile) continue;
+
     // Collect all added lines (lines starting with +, excluding +++ header)
     const addedLines = chunk
       .split("\n")
@@ -360,37 +364,36 @@ function validateDiffSyntax(diff) {
 
     const code = addedLines.join("\n");
 
-    // Check 1: balanced braces
+    // Check 1: balanced braces — for new files, all braces must balance
     let braceCount = 0;
     for (const ch of code) {
       if (ch === "{") braceCount++;
       if (ch === "}") braceCount--;
     }
     if (braceCount > 2) {
-      // Allow small imbalance (could be context), but large means truncation
       console.warn(
-        `[ai:run] WARNING: ${filePath} has ${braceCount} unclosed braces — likely truncated diff`,
+        `[ai:run] WARNING: new file ${filePath} has ${braceCount} unclosed braces — likely truncated`,
       );
       throw new Error(
-        `Diff for ${filePath} appears truncated (${braceCount} unclosed braces). ` +
-          `Increase AI_MAX_OUTPUT_TOKENS or generate smaller hunks.`,
+        `Diff for new file ${filePath} appears truncated (${braceCount} unclosed braces). ` +
+          `Increase AI_MAX_OUTPUT_TOKENS or generate smaller components.`,
       );
     }
 
-    // Check 2: basic JSX tag balance for self-evident tags
-    const openTags = (code.match(/<(?!\/|!)[a-zA-Z][^>]*(?<!\/)>/g) || []).length;
+    // Check 2: basic JSX tag balance — only for new files
+    const openTags = (code.match(/<(?!\/|!)[a-zA-Z][^>]*(?<!\/)>/g) || [])
+      .length;
     const closeTags = (code.match(/<\/[a-zA-Z][^>]*>/g) || []).length;
     const selfClosing = (code.match(/<[a-zA-Z][^>]*\/>/g) || []).length;
     const unclosedJsx = openTags - closeTags - selfClosing;
 
-    // Only flag egregious mismatches (>3 means something is clearly cut off)
     if (unclosedJsx > 3) {
       console.warn(
-        `[ai:run] WARNING: ${filePath} has ~${unclosedJsx} unclosed JSX tags — likely truncated diff`,
+        `[ai:run] WARNING: new file ${filePath} has ~${unclosedJsx} unclosed JSX tags — likely truncated`,
       );
       throw new Error(
-        `Diff for ${filePath} appears truncated (~${unclosedJsx} unclosed JSX tags). ` +
-          `Increase AI_MAX_OUTPUT_TOKENS or generate smaller hunks.`,
+        `Diff for new file ${filePath} appears truncated (~${unclosedJsx} unclosed JSX tags). ` +
+          `Increase AI_MAX_OUTPUT_TOKENS or generate smaller components.`,
       );
     }
   }
@@ -846,8 +849,8 @@ async function callAgent({
           "",
           "CRITICAL FORMAT RULES (you MUST follow these exactly):",
           "- Your entire response must contain EXACTLY two fenced code blocks.",
-          '- The first block MUST start with ```diff and end with ```',
-          '- The second block MUST start with ```md and end with ```',
+          "- The first block MUST start with ```diff and end with ```",
+          "- The second block MUST start with ```md and end with ```",
           "- Do NOT output ANY text before the first ``` or after the last ```.",
           "- Do NOT use ```patch, ```text, ```shell, or any other language tag for the diff.",
           "- Do NOT output the diff as plain text without fences.",
@@ -1109,7 +1112,9 @@ function extractErrorFile(gatesLog) {
   const lines = String(gatesLog || "").split("\n");
   for (const line of lines) {
     // Look for absolute paths or relative paths ending in .tsx/.ts/.js/.jsx
-    const m = line.match(/(?:^|\s)((?:\/[\w.-]+)+\/[\w.-]+\.(?:tsx?|jsx?|mts|cts))\s*$/);
+    const m = line.match(
+      /(?:^|\s)((?:\/[\w.-]+)+\/[\w.-]+\.(?:tsx?|jsx?|mts|cts))\s*$/,
+    );
     if (m) {
       // Extract just the relative part (from src/ or app/)
       const full = m[1];
@@ -1134,10 +1139,18 @@ function buildLintFixInstructions(gatesLog) {
   }
   parts.push("");
   parts.push("Common causes of these errors in diffs:");
-  parts.push("- Unterminated string literal → the diff was truncated mid-line. Make sure all strings are closed.");
-  parts.push("- JSX element has no closing tag → a <tag> was opened but never closed with </tag> or />.");
-  parts.push("- Make sure every JSX element is properly closed in the generated code.");
-  parts.push("- If the diff is large, prefer smaller focused hunks over replacing entire files.");
+  parts.push(
+    "- Unterminated string literal → the diff was truncated mid-line. Make sure all strings are closed.",
+  );
+  parts.push(
+    "- JSX element has no closing tag → a <tag> was opened but never closed with </tag> or />.",
+  );
+  parts.push(
+    "- Make sure every JSX element is properly closed in the generated code.",
+  );
+  parts.push(
+    "- If the diff is large, prefer smaller focused hunks over replacing entire files.",
+  );
   return parts.join("\n");
 }
 
