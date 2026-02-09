@@ -16,6 +16,8 @@ const PR_BODY_EN_PATH = ".ai/PR_BODY.en.md";
 const LAST_OUTPUT_PATH = ".ai/last-output.txt";
 const GATES_LOG_PATH = ".ai/gates.log";
 
+const OPENAI_BASE_URL = "https://api.openai.com/v1";
+
 function mustEnv(name) {
   const v = process.env[name];
   if (!v) throw new Error(`Missing env: ${name}`);
@@ -63,11 +65,6 @@ function runCapture(cmd, args) {
     stdout: r.stdout ?? "",
     stderr: r.stderr ?? "",
   };
-}
-
-function runCheck(cmd, args) {
-  const r = spawnSync(cmd, args, { stdio: "inherit" });
-  return r.status === 0;
 }
 
 function looksLikeUnifiedDiff(diff) {
@@ -272,7 +269,7 @@ function assertDoNotTouchUnlessTask({ diff, taskText, allowedPaths }) {
 }
 
 // -----------------------------
-// Anthropic API
+// Anthropic API (Fix/Review only)
 // -----------------------------
 async function anthropicMessagesCreate({
   apiKey,
@@ -318,6 +315,61 @@ async function anthropicMessagesCreate({
   return String(text || "");
 }
 
+// -----------------------------
+// OpenAI API (Code + Translate)
+// -----------------------------
+async function openaiResponsesCreate({
+  apiKey,
+  model,
+  system,
+  userText,
+  maxTokens,
+  temperature,
+}) {
+  const body = {
+    model,
+    input: [
+      ...(system && String(system).trim()
+        ? [{ role: "system", content: String(system) }]
+        : []),
+      { role: "user", content: String(userText || "") },
+    ],
+  };
+
+  if (typeof maxTokens === "number") body.max_output_tokens = maxTokens;
+  if (typeof temperature === "number") body.temperature = temperature;
+
+  const res = await fetch(`${OPENAI_BASE_URL}/responses`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      authorization: `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify(body),
+  });
+
+  const json = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const msg =
+      json?.error?.message || json?.message || JSON.stringify(json || {});
+    throw new Error(
+      `OpenAI API error: ${res.status} ${res.statusText} - ${msg}`,
+    );
+  }
+
+  const output = Array.isArray(json?.output) ? json.output : [];
+  const text = output
+    .flatMap((o) => (Array.isArray(o?.content) ? o.content : []))
+    .filter((c) => c && c.type === "output_text" && typeof c.text === "string")
+    .map((c) => c.text)
+    .join("");
+
+  const fallbackText =
+    typeof json?.output_text === "string" ? json.output_text : "";
+
+  return String(text || fallbackText || "");
+}
+
 async function translatePrBodyToKorean({ model, text }) {
   const instructions = [
     "Translate the given GitHub pull request description into natural Korean.",
@@ -328,8 +380,8 @@ async function translatePrBodyToKorean({ model, text }) {
   ].join("\n");
 
   const out = (
-    await anthropicMessagesCreate({
-      apiKey: mustEnv("ANTHROPIC_API_KEY"),
+    await openaiResponsesCreate({
+      apiKey: mustEnv("OPENAI_API_KEY"),
       model,
       system: instructions,
       userText: text,
@@ -342,6 +394,7 @@ async function translatePrBodyToKorean({ model, text }) {
 }
 
 async function callAgent({
+  provider, // "openai" | "anthropic"
   model,
   temperature,
   maxOutputTokens,
@@ -431,14 +484,28 @@ async function callAgent({
     );
   }
 
-  const out = await anthropicMessagesCreate({
-    apiKey: mustEnv("ANTHROPIC_API_KEY"),
-    model,
-    system: instructions,
-    userText: inputParts.join(""),
-    maxTokens: maxOutputTokens,
-    temperature,
-  });
+  const userText = inputParts.join("");
+  let out = "";
+
+  if (provider === "openai") {
+    out = await openaiResponsesCreate({
+      apiKey: mustEnv("OPENAI_API_KEY"),
+      model,
+      system: instructions,
+      userText,
+      maxTokens: maxOutputTokens,
+      temperature,
+    });
+  } else {
+    out = await anthropicMessagesCreate({
+      apiKey: mustEnv("ANTHROPIC_API_KEY"),
+      model,
+      system: instructions,
+      userText,
+      maxTokens: maxOutputTokens,
+      temperature,
+    });
+  }
 
   await fs.mkdir(".ai", { recursive: true });
   await fs.writeFile(LAST_OUTPUT_PATH, out, "utf8");
@@ -484,8 +551,8 @@ async function callAgent({
   await fs.writeFile(PATCH_PATH, diff + "\n", "utf8");
   await fs.writeFile(PR_BODY_EN_PATH, prBodyEn + "\n", "utf8");
 
-  // translate PR body
-  const translateModel = readString("ANTHROPIC_TRANSLATE_MODEL", model);
+  // translate PR body (OpenAI only)
+  const translateModel = readString("OPENAI_TRANSLATE_MODEL", "gpt-5.2");
   const koBody = await translatePrBodyToKorean({
     model: translateModel,
     text: prBodyEn,
@@ -495,15 +562,29 @@ async function callAgent({
   // check patch applicability (capture reason if fails)
   const chk = runCapture("git", [
     "apply",
-    "--check",
+    " --check",
     "--recount",
     "--whitespace=nowarn",
     "-p1",
     PATCH_PATH,
   ]);
-  if (chk.status !== 0) {
-    // keep debug info in last-output
-    const debug = `\n\n# GIT_APPLY_CHECK_FAILED\n${chk.stderr}\n`;
+
+  // NOTE: some shells/users accidentally introduce a leading space in args;
+  // keep a second check without that just in case.
+  const chk2 =
+    chk.status === 0
+      ? chk
+      : runCapture("git", [
+          "apply",
+          "--check",
+          "--recount",
+          "--whitespace=nowarn",
+          "-p1",
+          PATCH_PATH,
+        ]);
+
+  if (chk2.status !== 0) {
+    const debug = `\n\n# GIT_APPLY_CHECK_FAILED\n${chk2.stderr}\n`;
     await fs.writeFile(LAST_OUTPUT_PATH, out + debug, "utf8");
     throw new Error(
       `Generated patch is not applicable. See ${LAST_OUTPUT_PATH} and ${PATCH_PATH}`,
@@ -545,10 +626,11 @@ async function main() {
 
   const requiredFiles = parseRequiredFilesFromTask(task);
 
-  console.log("[ai:run] calling Claude (Anthropic)...");
-  mustEnv("ANTHROPIC_API_KEY");
+  // Models
+  const openaiModel = readString("OPENAI_MODEL", "gpt-5.2");
+  const claudeModel = readString("ANTHROPIC_MODEL", "claude-sonnet-4-5");
 
-  const model = readString("ANTHROPIC_MODEL", "claude-sonnet-4-5");
+  // Keep these knobs for now (shared)
   const maxOutputTokens = readNumber("ANTHROPIC_MAX_OUTPUT_TOKENS", 2200);
   const temperature = readOptionalNumber("ANTHROPIC_TEMPERATURE");
 
@@ -557,6 +639,18 @@ async function main() {
 
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
+      // attempt 1: OpenAI (code). attempt 2-3: Anthropic (fix/review)
+      const provider = attempt === 1 ? "openai" : "anthropic";
+      const model = provider === "openai" ? openaiModel : claudeModel;
+
+      if (provider === "openai") {
+        console.log("[ai:run] calling OpenAI (code)...");
+        mustEnv("OPENAI_API_KEY");
+      } else {
+        console.log("[ai:run] calling Claude (Anthropic) for fix/review...");
+        mustEnv("ANTHROPIC_API_KEY");
+      }
+
       const extraRules =
         attempt === 1
           ? ""
@@ -571,6 +665,7 @@ async function main() {
       await cleanupArtifacts();
 
       await callAgent({
+        provider,
         model,
         temperature,
         maxOutputTokens,
