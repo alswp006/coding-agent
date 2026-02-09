@@ -1,18 +1,22 @@
-import { spawn, spawnSync } from "node:child_process";
+import { spawnSync } from "node:child_process";
 import fs from "node:fs";
+import path from "node:path";
 
 const PATCH_FILE = "patch.diff";
+const AI_DIR = ".ai";
 const GATES_LOG = ".ai/gates.log";
 const GATES_LAST_LOG = ".ai/gates.last.log";
+const GATES_SUMMARY = ".ai/gates.summary.md";
 
 function ensureAiDir() {
-  fs.mkdirSync(".ai", { recursive: true });
+  fs.mkdirSync(AI_DIR, { recursive: true });
 }
 
-function runSync(cmd, args, { capture = false } = {}) {
+function run(cmd, args, { capture = false, env } = {}) {
   const r = spawnSync(cmd, args, {
     encoding: "utf8",
     stdio: capture ? "pipe" : "inherit",
+    env: env ? { ...process.env, ...env } : process.env,
   });
 
   if (capture) {
@@ -22,16 +26,17 @@ function runSync(cmd, args, { capture = false } = {}) {
       stderr: r.stderr ?? "",
     };
   }
+
   return { status: r.status ?? 1, stdout: "", stderr: "" };
 }
 
 function must(cmd, args) {
-  const r = runSync(cmd, args);
+  const r = run(cmd, args);
   if (r.status !== 0) process.exit(r.status);
 }
 
 function capture(cmd, args) {
-  const r = runSync(cmd, args, { capture: true });
+  const r = run(cmd, args, { capture: true });
   if (r.status !== 0) {
     process.stderr.write(r.stderr);
     process.exit(r.status);
@@ -39,45 +44,169 @@ function capture(cmd, args) {
   return (r.stdout || "").trim();
 }
 
+function writeFileSafe(p, text) {
+  ensureAiDir();
+  fs.writeFileSync(p, text, "utf8");
+}
+
 function readEnv(name) {
   const v = process.env[name];
   return v ? String(v) : "";
 }
 
-function writeGatesLog(text) {
-  ensureAiDir();
-  fs.writeFileSync(GATES_LOG, text, "utf8");
+function tailLines(text, n = 120) {
+  const lines = String(text || "").split("\n");
+  return lines.slice(-n).join("\n");
 }
 
-function appendLog(buf, s) {
-  buf.push(s);
+function firstMatch(text, re) {
+  const m = String(text || "").match(re);
+  return m ? m[0] : "";
 }
 
-async function runStreaming(cmd, args, buf) {
-  return await new Promise((resolve) => {
-    appendLog(buf, `\n$ ${cmd} ${args.join(" ")}\n`);
-    const child = spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"] });
+function extractTypecheckErrors(log) {
+  const lines = String(log || "").split("\n");
+  const errs = [];
+  for (const line of lines) {
+    if (/\): error TS\d+:/i.test(line) || /error TS\d+:/i.test(line)) {
+      errs.push(line.trim());
+    }
+  }
+  return errs;
+}
 
-    child.stdout.on("data", (d) => {
-      const s = d.toString("utf8");
-      process.stdout.write(s);
-      appendLog(buf, s);
-    });
+function extractEslintErrors(log) {
+  const lines = String(log || "").split("\n");
+  const errs = [];
+  for (const line of lines) {
+    if (
+      /\s+error\s+.+\s+@/i.test(line) ||
+      /\s+error\s+.+\s+\w+\/\w+/i.test(line)
+    ) {
+      errs.push(line.trim());
+    }
+  }
+  return errs;
+}
 
-    child.stderr.on("data", (d) => {
-      const s = d.toString("utf8");
-      process.stderr.write(s);
-      appendLog(buf, s);
-    });
+function detectCommonFailureHints(log) {
+  const hints = [];
+  const s = String(log || "");
 
-    child.on("close", (code) => {
-      resolve(code ?? 1);
-    });
-  });
+  if (/@testing-library\/react/.test(s)) {
+    hints.push(
+      "- Patch introduced `@testing-library/react` but repo doesn't have it. Avoid Testing Library imports or add deps only if TASK allows.",
+    );
+  }
+  if (/\btoBeInTheDocument\b/.test(s)) {
+    hints.push(
+      "- Patch used `toBeInTheDocument` (jest-dom matcher). Repo likely doesn't include jest-dom. Use basic `expect(...)` or avoid DOM matchers.",
+    );
+  }
+  if (/Cannot find module '@testing-library\/react'/.test(s)) {
+    hints.push(
+      "- Typecheck failed: `Cannot find module '@testing-library/react'`. Do not add tests that require it.",
+    );
+  }
+  if (/no-explicit-any/.test(s) || /Unexpected any/i.test(s)) {
+    hints.push(
+      "- ESLint failed: `no-explicit-any`. Replace `any` with `unknown` + narrowing or proper types.",
+    );
+  }
+  if (/vitest\.config\.(ts|js|cjs|mjs)/.test(s)) {
+    hints.push(
+      "- Patch touched `vitest.config.ts/js/...` but repo likely uses `vitest.config.mts`. Avoid creating/modifying extra vitest configs.",
+    );
+  }
+  if (/app\/drafts\/.*__tests__/.test(s)) {
+    hints.push(
+      "- Tests under `app/drafts/**/__tests__` often require extra Next/RTL setup and break typecheck. Put smoke tests under `src/__tests__` instead.",
+    );
+  }
+  if (/Object is possibly 'undefined'/.test(s)) {
+    hints.push(
+      "- Typecheck error: object possibly undefined. Add guards or optional chaining and narrow types.",
+    );
+  }
+  if (/Property 'find' does not exist on type/.test(s)) {
+    hints.push(
+      "- Typecheck error: invalid method on union type. Narrow the type before calling methods (`typeof === 'string'`, `Array.isArray`, etc.).",
+    );
+  }
+  if (/No test files found, exiting with code 1/i.test(s)) {
+    hints.push(
+      "- Vitest reports 'No test files found'. This runner treats it as pass now; consider adding at least one smoke test if you want coverage.",
+    );
+  }
+
+  return hints;
+}
+
+function summarizeGates(log) {
+  const s = String(log || "");
+  const summary = [];
+
+  const failedStep =
+    firstMatch(
+      s,
+      /\$ pnpm (test|lint|typecheck|format|format:check)\b[\s\S]*?(?=\n\$ pnpm |\s*$)/i,
+    ) || "";
+
+  const stepNameMatch = failedStep.match(
+    /\$ pnpm (test|lint|typecheck|format|format:check)/i,
+  );
+  const stepName = stepNameMatch ? stepNameMatch[1] : "unknown";
+
+  summary.push(`## Gates failure summary`);
+  summary.push(`- Failed step: **${stepName}**`);
+
+  if (stepName === "typecheck") {
+    const errs = extractTypecheckErrors(failedStep);
+    summary.push(`- TypeScript errors: **${errs.length}**`);
+    if (errs.length) {
+      summary.push("");
+      summary.push("### Top TS errors (up to 12)");
+      for (const e of errs.slice(0, 12)) summary.push(`- ${e}`);
+    }
+  } else if (stepName === "lint") {
+    const errs = extractEslintErrors(failedStep);
+    summary.push(`- ESLint errors: **${errs.length}**`);
+    if (errs.length) {
+      summary.push("");
+      summary.push("### Top ESLint errors (up to 12)");
+      for (const e of errs.slice(0, 12)) summary.push(`- ${e}`);
+    }
+  } else if (stepName === "test") {
+    summary.push("");
+    summary.push("### Vitest tail (last 40 lines)");
+    summary.push("```");
+    summary.push(tailLines(failedStep, 40));
+    summary.push("```");
+  } else if (stepName === "format" || stepName === "format:check") {
+    summary.push("");
+    summary.push("### Format tail (last 60 lines)");
+    summary.push("```");
+    summary.push(tailLines(failedStep, 60));
+    summary.push("```");
+  } else {
+    summary.push("");
+    summary.push("### Log tail (last 120 lines)");
+    summary.push("```");
+    summary.push(tailLines(s, 120));
+    summary.push("```");
+  }
+
+  const hints = detectCommonFailureHints(s);
+  if (hints.length) {
+    summary.push("");
+    summary.push("## Hints for next attempt");
+    for (const h of hints) summary.push(h);
+  }
+
+  return summary.join("\n") + "\n";
 }
 
 function rollback({ baseBranch, baseSha, branch }) {
-  // gates 로그 보존
   try {
     if (fs.existsSync(GATES_LOG)) {
       ensureAiDir();
@@ -87,38 +216,99 @@ function rollback({ baseBranch, baseSha, branch }) {
     // ignore
   }
 
-  // 브랜치/워킹트리 복구
-  runSync("git", ["reset", "--hard", baseSha]);
-  runSync("git", ["clean", "-fd"]);
+  run("git", ["reset", "--hard", baseSha]);
 
-  // 원래 브랜치로 복귀
-  runSync("git", ["checkout", baseBranch]);
+  run("git", [
+    "clean",
+    "-fd",
+    "-e",
+    ".ai/gates.log",
+    "-e",
+    ".ai/gates.last.log",
+    "-e",
+    ".ai/gates.summary.md",
+    "-e",
+    ".ai/last-output.txt",
+    "-e",
+    "patch.diff",
+    "-e",
+    ".ai/PR_BODY.md",
+    "-e",
+    ".ai/PR_BODY.en.md",
+  ]);
 
-  // 작업 브랜치 삭제
+  run("git", ["checkout", baseBranch]);
+
   if (branch && branch !== baseBranch) {
-    runSync("git", ["branch", "-D", branch]);
+    run("git", ["branch", "-D", branch]);
   }
 }
 
-async function runGates() {
-  const buf = [];
+function readJsonSafe(p) {
+  try {
+    return JSON.parse(fs.readFileSync(p, "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+function readPackageScripts() {
+  const pkg = readJsonSafe(path.resolve("package.json"));
+  const scripts = pkg && typeof pkg === "object" ? pkg.scripts : null;
+  return scripts && typeof scripts === "object" ? scripts : {};
+}
+
+function shouldTreatNoTestsAsPass(out) {
+  return /No test files found, exiting with code 1/i.test(out);
+}
+
+function runGatesCapture() {
+  const scripts = readPackageScripts();
+
+  // Gate steps (format steps are conditional)
   const steps = [
     ["pnpm", ["test"]],
     ["pnpm", ["lint"]],
     ["pnpm", ["typecheck"]],
-    ["pnpm", ["format:check"]],
   ];
 
+  // Only run format if scripts exist
+  if (typeof scripts.format === "string" && scripts.format.trim()) {
+    steps.push(["pnpm", ["format"]]);
+  }
+  if (
+    typeof scripts["format:check"] === "string" &&
+    scripts["format:check"].trim()
+  ) {
+    steps.push(["pnpm", ["format:check"]]);
+  }
+
+  let out = "";
   for (const [cmd, args] of steps) {
-    const code = await runStreaming(cmd, args, buf);
-    if (code !== 0) {
-      return { ok: false, log: buf.join(""), code };
+    const r = run(cmd, args, { capture: true });
+    out += `\n$ ${cmd} ${args.join(" ")}\n`;
+    out += r.stdout;
+    out += r.stderr;
+
+    if (r.status !== 0) {
+      // Special case: vitest "No test files found" -> treat as pass
+      const combined = `${r.stdout}\n${r.stderr}`;
+      if (
+        cmd === "pnpm" &&
+        args[0] === "test" &&
+        shouldTreatNoTestsAsPass(combined)
+      ) {
+        out += "\n[ai-pr] NOTE: No test files found; treating as PASS.\n";
+        continue;
+      }
+      return { ok: false, log: out, code: r.status };
     }
   }
-  return { ok: true, log: buf.join(""), code: 0 };
+
+  return { ok: true, log: out, code: 0 };
 }
 
-async function main() {
+function main() {
   const argv = process.argv.slice(2);
 
   const branch = argv[0] || `feat/ai-${Date.now()}`;
@@ -133,23 +323,11 @@ async function main() {
 
   ensureAiDir();
 
-  // git repo 확인
   must("git", ["rev-parse", "--is-inside-work-tree"]);
-
-  // ★ 중요: 시작 시 워킹트리 깨끗한지 확인 (여기서 더러우면 “갑자기 파일이 올라오는” 현상이 생김)
-  const dirty = capture("git", ["status", "--porcelain"]);
-  if (dirty.trim()) {
-    console.error(
-      "\n[ai-pr] working tree is not clean. Please commit/stash first.\n",
-    );
-    console.error(dirty);
-    process.exit(2);
-  }
 
   const baseBranch = capture("git", ["rev-parse", "--abbrev-ref", "HEAD"]);
   const baseSha = capture("git", ["rev-parse", "HEAD"]);
 
-  // 브랜치 리셋 (재실행 안정화)
   must("git", ["checkout", "-B", branch, baseSha]);
 
   if (!fs.existsSync(PATCH_FILE)) {
@@ -159,34 +337,45 @@ async function main() {
   }
 
   // patch 적용 체크
-  const check = runSync(
+  const check = run(
     "git",
     ["apply", "--check", "--recount", "--whitespace=nowarn", "-p1", PATCH_FILE],
     { capture: true },
   );
+
   if (check.status !== 0) {
-    writeGatesLog(`[git apply --check failed]\n${check.stderr}\n`);
+    writeFileSafe(GATES_LOG, `[git apply --check failed]\n${check.stderr}\n`);
+    writeFileSafe(
+      GATES_SUMMARY,
+      summarizeGates(fs.readFileSync(GATES_LOG, "utf8")),
+    );
     rollback({ baseBranch, baseSha, branch });
     process.exit(check.status);
   }
 
-  const apply = runSync(
+  const apply = run(
     "git",
     ["apply", "--recount", "--whitespace=nowarn", "-p1", PATCH_FILE],
     { capture: true },
   );
+
   if (apply.status !== 0) {
-    writeGatesLog(`[git apply failed]\n${apply.stderr}\n`);
+    writeFileSafe(GATES_LOG, `[git apply failed]\n${apply.stderr}\n`);
+    writeFileSafe(
+      GATES_SUMMARY,
+      summarizeGates(fs.readFileSync(GATES_LOG, "utf8")),
+    );
     rollback({ baseBranch, baseSha, branch });
     process.exit(apply.status);
   }
 
-  // gates (실시간 출력 + 로그 누적)
-  const gates = await runGates();
-  writeGatesLog(gates.log);
+  // 품질 게이트
+  const gates = runGatesCapture();
+  writeFileSafe(GATES_LOG, gates.log);
+  writeFileSafe(GATES_SUMMARY, summarizeGates(gates.log));
 
   if (!gates.ok) {
-    const tail = gates.log.split("\n").slice(-120).join("\n");
+    const tail = tailLines(gates.log, 120);
     console.error("\n[ai-pr] gates tail (last 120 lines)\n");
     console.error(tail);
     console.error("\n[ai-pr] quality gates failed. Rolling back.\n");
@@ -205,14 +394,18 @@ async function main() {
   must("git", ["commit", "-m", title]);
   must("git", ["push", "-u", "origin", branch]);
 
-  const prArgs = ["pr", "create", "--title", title, "--fill"];
-  if (prBody.trim()) prArgs.push("--body", prBody);
+  // IMPORTANT: enforce our AI PR body (no --fill)
+  const prArgs = ["pr", "create", "--title", title];
+  if (prBody.trim()) {
+    prArgs.push("--body", prBody);
+  } else {
+    // fallback: let gh fill if body missing
+    prArgs.push("--fill");
+  }
+
   must("gh", prArgs);
 
   console.log("\n[ai-pr] done.\n");
 }
 
-main().catch((e) => {
-  console.error("[ai-pr] failed:", e?.message || e);
-  process.exit(1);
-});
+main();

@@ -56,6 +56,15 @@ async function cleanupArtifacts() {
   await rmIfExists(LAST_OUTPUT_PATH);
 }
 
+function runCapture(cmd, args) {
+  const r = spawnSync(cmd, args, { encoding: "utf8", stdio: "pipe" });
+  return {
+    status: r.status ?? 1,
+    stdout: r.stdout ?? "",
+    stderr: r.stderr ?? "",
+  };
+}
+
 function runCheck(cmd, args) {
   const r = spawnSync(cmd, args, { stdio: "inherit" });
   return r.status === 0;
@@ -94,6 +103,13 @@ function pickBestMd(blocks) {
   return first.length >= 200 ? first : longest;
 }
 
+/**
+ * Parse TASK.md for "Files to create" section.
+ * Expected format:
+ * ## Files to create
+ * - path
+ * - path
+ */
 function parseRequiredFilesFromTask(taskText) {
   const lines = taskText.split("\n");
   const required = [];
@@ -101,12 +117,14 @@ function parseRequiredFilesFromTask(taskText) {
   let inSection = false;
   for (const raw of lines) {
     const line = raw.trim();
+
     if (/^##\s+Files to create\s*$/i.test(line)) {
       inSection = true;
       continue;
     }
     if (inSection && /^##\s+/.test(line)) break;
     if (!inSection) continue;
+
     const m = line.match(/^-\s+(.+)$/);
     if (m) required.push(m[1].trim());
   }
@@ -122,6 +140,7 @@ function mustIncludeRequiredFiles(diff, requiredPaths) {
     const header = `diff --git a/${p} b/${p}`;
     if (!diff.includes(header)) missing.push(p);
   }
+
   if (missing.length) {
     throw new Error(
       `Diff missing required files:\n- ${missing.join("\n- ")}\n` +
@@ -130,35 +149,96 @@ function mustIncludeRequiredFiles(diff, requiredPaths) {
   }
 }
 
-// ---- IMPORTANT: forbid patterns that repeatedly broke your gates
+// -----------------------------
+// Policy / Forbidden guards
+// -----------------------------
+
+function assertPatchPolicy({
+  diff,
+  repoUsesVitestMts = true,
+  forbidReactTestingLib = true,
+  forbidAppDraftsTests = true,
+}) {
+  // 1) vitest config 중복/변형 방지
+  const forbiddenVitestConfigs = [
+    "vitest.config.ts",
+    "vitest.config.js",
+    "vitest.config.cjs",
+    "vitest.config.mjs",
+  ];
+
+  if (repoUsesVitestMts) {
+    for (const f of forbiddenVitestConfigs) {
+      const re = new RegExp(
+        `^diff --git a/${f.replace(/\./g, "\\.")} b/${f.replace(/\./g, "\\.")}$`,
+        "m",
+      );
+      if (re.test(diff)) {
+        throw new Error(
+          `Policy violation: forbidden change detected: ${f} (repo already uses vitest.config.mts)`,
+        );
+      }
+    }
+  }
+
+  // 2) app/drafts/** 테스트 추가 금지
+  if (forbidAppDraftsTests) {
+    const re =
+      /^diff --git a\/app\/drafts\/.*__tests__\/.* b\/app\/drafts\/.*__tests__\/.*/m;
+    if (re.test(diff)) {
+      throw new Error(
+        `Policy violation: tests under app/drafts/**/__tests__ are not allowed (breaks typecheck/lint due to missing deps).`,
+      );
+    }
+  }
+
+  // 3) Testing Library import 금지
+  if (forbidReactTestingLib) {
+    const re = /@testing-library\/react/;
+    if (re.test(diff)) {
+      throw new Error(
+        `Policy violation: patch introduces @testing-library/react but repo doesn't include it.`,
+      );
+    }
+  }
+
+  // 4) package.json 변경 금지 (Task가 허용할 때만)
+  const pkgRe = /^diff --git a\/package\.json b\/package\.json/m;
+  if (pkgRe.test(diff)) {
+    throw new Error(
+      `Policy violation: patch modifies package.json. Keep dependencies unchanged unless TASK explicitly allows.`,
+    );
+  }
+}
+
 const FORBIDDEN_DIFF_PATTERNS = [
   {
-    re: /@testing-library\/react/g,
+    re: /@testing-library\/react/,
     message:
       "Do NOT introduce @testing-library/react. Repo does not have it and typecheck will fail.",
   },
   {
-    re: /@testing-library\/jest-dom/g,
+    re: /@testing-library\/jest-dom/,
     message:
       "Do NOT introduce @testing-library/jest-dom. Repo does not have it and typecheck will fail.",
   },
   {
-    re: /\btoBeInTheDocument\b/g,
+    re: /\btoBeInTheDocument\b/,
     message:
-      "Do NOT use toBeInTheDocument (jest-dom matcher). Use basic expect(...) or renderToString checks.",
+      "Do NOT use toBeInTheDocument (jest-dom matcher). Use basic expect(...) only.",
   },
   {
-    re: /^diff --git a\/app\/.*\/__tests__\/.* b\/app\/.*\/__tests__\/.*/gm,
+    re: /^diff --git a\/app\/.*\/__tests__\/.* b\/app\/.*\/__tests__\/.*/m,
     message:
-      "Do NOT create tests under app/**/__tests__ (Next app tests commonly require extra libs). Put tests under src/__tests__ instead.",
+      "Do NOT create tests under app/**/__tests__. Put tests under src/__tests__ instead.",
   },
   {
-    re: /^diff --git a\/vitest\.config\.(ts|js|cjs|mjs) b\/vitest\.config\.(ts|js|cjs|mjs)$/gm,
+    re: /^diff --git a\/vitest\.config\.(ts|js|cjs|mjs) b\/vitest\.config\.(ts|js|cjs|mjs)$/m,
     message:
       "Do NOT create/modify vitest.config.ts/js/cjs/mjs. This repo uses vitest.config.mts (or existing config).",
   },
   {
-    re: /^diff --git a\/vitest\.setup\.ts b\/vitest\.setup\.ts$/gm,
+    re: /^diff --git a\/vitest\.setup\.ts b\/vitest\.setup\.ts$/m,
     message:
       "Do NOT add vitest.setup.ts unless an existing vitest config already references it.",
   },
@@ -173,13 +253,16 @@ function assertNoForbiddenDiff(diff) {
 }
 
 function assertDoNotTouchUnlessTask({ diff, taskText, allowedPaths }) {
+  // 보호 파일: 코더가 괜히 건드리면 patch apply conflict / 의미 없는 변경이 자주 발생
   const protectedPaths = ["src/__tests__/smoke.test.ts"];
+
   for (const p of protectedPaths) {
     const header = `diff --git a/${p} b/${p}`;
     if (!diff.includes(header)) continue;
 
     const mentionedInTask = taskText.includes(p);
     const allowed = allowedPaths.includes(p);
+
     if (!mentionedInTask && !allowed) {
       throw new Error(
         `Do NOT modify ${p} unless TASK explicitly asks for it. Regenerate diff without touching ${p}.`,
@@ -188,9 +271,9 @@ function assertDoNotTouchUnlessTask({ diff, taskText, allowedPaths }) {
   }
 }
 
-/**
- * Anthropic Messages API call (non-streaming)
- */
+// -----------------------------
+// Anthropic API
+// -----------------------------
 async function anthropicMessagesCreate({
   apiKey,
   model,
@@ -204,6 +287,7 @@ async function anthropicMessagesCreate({
     max_tokens: maxTokens,
     messages: [{ role: "user", content: userText }],
   };
+
   if (system && String(system).trim()) body.system = system;
   if (temperature !== undefined) body.temperature = temperature;
 
@@ -315,7 +399,6 @@ async function callAgent({
     "Testing constraints (IMPORTANT):",
     "- Do NOT use @testing-library/react or jest-dom matchers.",
     "- Do NOT create tests under app/**/__tests__.",
-    "- If you need to test a Next page/component, do it from src/__tests__ and use react-dom/server `renderToString` for basic smoke checks.",
     '- For Vitest test files, always import: `import { describe, it, expect } from "vitest";`',
     "",
     "Repo invariants:",
@@ -390,6 +473,14 @@ async function callAgent({
     allowedPaths: requiredFiles,
   });
 
+  // policy gate
+  assertPatchPolicy({
+    diff,
+    repoUsesVitestMts: existsSync("vitest.config.mts"),
+    forbidReactTestingLib: true,
+    forbidAppDraftsTests: true,
+  });
+
   await fs.writeFile(PATCH_PATH, diff + "\n", "utf8");
   await fs.writeFile(PR_BODY_EN_PATH, prBodyEn + "\n", "utf8");
 
@@ -401,8 +492,8 @@ async function callAgent({
   });
   await fs.writeFile(PR_BODY_PATH, koBody + "\n", "utf8");
 
-  // check patch applicability
-  const ok = runCheck("git", [
+  // check patch applicability (capture reason if fails)
+  const chk = runCapture("git", [
     "apply",
     "--check",
     "--recount",
@@ -410,7 +501,10 @@ async function callAgent({
     "-p1",
     PATCH_PATH,
   ]);
-  if (!ok) {
+  if (chk.status !== 0) {
+    // keep debug info in last-output
+    const debug = `\n\n# GIT_APPLY_CHECK_FAILED\n${chk.stderr}\n`;
+    await fs.writeFile(LAST_OUTPUT_PATH, out + debug, "utf8");
     throw new Error(
       `Generated patch is not applicable. See ${LAST_OUTPUT_PATH} and ${PATCH_PATH}`,
     );
@@ -472,7 +566,6 @@ async function main() {
               "Do not output header-only diffs (e.g., index ...e69de29).",
               "Fix issues reported in the gates log if provided.",
               "Reminder: no @testing-library/*, no toBeInTheDocument, no app/**/__tests__.",
-              "If you need a UI smoke test, put it under src/__tests__ and use react-dom/server renderToString.",
             ].join(" ");
 
       await cleanupArtifacts();
