@@ -22,7 +22,7 @@ build/
 .ai/PROMPT_BUNDLE.md
 .ai/last-output.txt
 .ai/gates.log
-.ai/gates*.log
+.ai/gates*
 .ai/PR_BODY.md
 .ai/PR_BODY*.md
 .ai/TASK.md

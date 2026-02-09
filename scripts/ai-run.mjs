@@ -77,7 +77,12 @@ function looksLikeUnifiedDiff(diff) {
 }
 
 function extractAllCodeBlocks(text, lang) {
-  const re = new RegExp("```" + lang + "\\n([\\s\\S]*?)\\n```", "gm");
+  // More lenient: allow optional trailing whitespace/spaces after lang tag,
+  // handle \r\n, and also match lang tags with trailing punctuation like "diff:"
+  const re = new RegExp(
+    "```" + lang + "[:\\s]*\\r?\\n([\\s\\S]*?)\\r?\\n\\s*```",
+    "gm",
+  );
   const blocks = [];
   let m;
   while ((m = re.exec(text)) !== null) {
@@ -323,6 +328,73 @@ function tryGitApply(patchPath) {
 }
 
 // ─────────────────────────────────────────────────────────────
+
+// ─────────────────────────────────────────────────────────────
+// ★ NEW: Basic syntax sanity check on diff-added lines
+// ─────────────────────────────────────────────────────────────
+
+/**
+ * Extract all "+"-prefixed lines (new code) from a unified diff
+ * for files with .tsx/.jsx extension, then do a basic bracket/tag balance check.
+ * This catches obvious truncation before we even try git apply.
+ */
+function validateDiffSyntax(diff) {
+  // Parse diff into per-file chunks
+  const fileChunks = diff.split(/^(?=diff --git )/m);
+
+  for (const chunk of fileChunks) {
+    const headerMatch = chunk.match(/^diff --git a\/(.+?) b\/(.+?)$/m);
+    if (!headerMatch) continue;
+    const filePath = headerMatch[2];
+
+    // Only check TSX/JSX files (most common source of tag mismatch)
+    if (!/\.[tj]sx$/.test(filePath)) continue;
+
+    // Collect all added lines (lines starting with +, excluding +++ header)
+    const addedLines = chunk
+      .split("\n")
+      .filter((l) => l.startsWith("+") && !l.startsWith("+++"))
+      .map((l) => l.slice(1)); // remove the leading "+"
+
+    if (addedLines.length === 0) continue;
+
+    const code = addedLines.join("\n");
+
+    // Check 1: balanced braces
+    let braceCount = 0;
+    for (const ch of code) {
+      if (ch === "{") braceCount++;
+      if (ch === "}") braceCount--;
+    }
+    if (braceCount > 2) {
+      // Allow small imbalance (could be context), but large means truncation
+      console.warn(
+        `[ai:run] WARNING: ${filePath} has ${braceCount} unclosed braces — likely truncated diff`,
+      );
+      throw new Error(
+        `Diff for ${filePath} appears truncated (${braceCount} unclosed braces). ` +
+          `Increase AI_MAX_OUTPUT_TOKENS or generate smaller hunks.`,
+      );
+    }
+
+    // Check 2: basic JSX tag balance for self-evident tags
+    const openTags = (code.match(/<(?!\/|!)[a-zA-Z][^>]*(?<!\/)>/g) || []).length;
+    const closeTags = (code.match(/<\/[a-zA-Z][^>]*>/g) || []).length;
+    const selfClosing = (code.match(/<[a-zA-Z][^>]*\/>/g) || []).length;
+    const unclosedJsx = openTags - closeTags - selfClosing;
+
+    // Only flag egregious mismatches (>3 means something is clearly cut off)
+    if (unclosedJsx > 3) {
+      console.warn(
+        `[ai:run] WARNING: ${filePath} has ~${unclosedJsx} unclosed JSX tags — likely truncated diff`,
+      );
+      throw new Error(
+        `Diff for ${filePath} appears truncated (~${unclosedJsx} unclosed JSX tags). ` +
+          `Increase AI_MAX_OUTPUT_TOKENS or generate smaller hunks.`,
+      );
+    }
+  }
+}
 
 function pickBestDiff(blocks) {
   if (!blocks.length) return null;
@@ -966,6 +1038,9 @@ async function callAgent({
   // required files
   mustIncludeRequiredFiles(diff, requiredFiles);
 
+  // ★ NEW: basic syntax sanity check on diff content — catch obvious truncation
+  validateDiffSyntax(diff);
+
   // hard guards
   assertNoForbiddenDiff(diff);
   assertDoNotTouchUnlessTask({
@@ -1012,6 +1087,60 @@ async function callAgent({
   }
 }
 
+// ─────────────────────────────────────────────────────────────
+// ★ NEW: Extract specific lint/typecheck errors from gates log
+// ─────────────────────────────────────────────────────────────
+
+function extractLintErrors(gatesLog) {
+  const lines = String(gatesLog || "").split("\n");
+  const errors = [];
+  for (const line of lines) {
+    // ESLint format: "  95:0  error  Parsing error: Unterminated string literal"
+    // or: "  103:13  error  Parsing error: JSX element 'label' has no corresponding closing tag"
+    const m = line.match(/^\s*(\d+:\d+)\s+error\s+(.+)$/);
+    if (m) errors.push({ loc: m[1], message: m[2].trim() });
+  }
+  return errors;
+}
+
+function extractErrorFile(gatesLog) {
+  // Extract the file path from ESLint output like:
+  // "/Users/.../src/components/NewDraftPage.tsx"
+  const lines = String(gatesLog || "").split("\n");
+  for (const line of lines) {
+    // Look for absolute paths or relative paths ending in .tsx/.ts/.js/.jsx
+    const m = line.match(/(?:^|\s)((?:\/[\w.-]+)+\/[\w.-]+\.(?:tsx?|jsx?|mts|cts))\s*$/);
+    if (m) {
+      // Extract just the relative part (from src/ or app/)
+      const full = m[1];
+      const relMatch = full.match(/((?:src|app)\/[\w./-]+)$/);
+      return relMatch ? relMatch[1] : full;
+    }
+  }
+  return null;
+}
+
+function buildLintFixInstructions(gatesLog) {
+  const errors = extractLintErrors(gatesLog);
+  const file = extractErrorFile(gatesLog);
+  if (!errors.length) return "";
+
+  const parts = [
+    "LINT/TYPECHECK ERRORS FROM PREVIOUS ATTEMPT (you MUST fix these):",
+  ];
+  if (file) parts.push(`File: ${file}`);
+  for (const e of errors) {
+    parts.push(`  Line ${e.loc}: ${e.message}`);
+  }
+  parts.push("");
+  parts.push("Common causes of these errors in diffs:");
+  parts.push("- Unterminated string literal → the diff was truncated mid-line. Make sure all strings are closed.");
+  parts.push("- JSX element has no closing tag → a <tag> was opened but never closed with </tag> or />.");
+  parts.push("- Make sure every JSX element is properly closed in the generated code.");
+  parts.push("- If the diff is large, prefer smaller focused hunks over replacing entire files.");
+  return parts.join("\n");
+}
+
 async function readGatesLog() {
   try {
     return await fs.readFile(GATES_LOG_PATH, "utf8");
@@ -1054,7 +1183,8 @@ async function main() {
   const claudeModel = readString("ANTHROPIC_MODEL", "claude-sonnet-4-5");
 
   // Tokens/temperature knobs
-  const maxOutputTokens = readNumber("AI_MAX_OUTPUT_TOKENS", 2200);
+  // ★ Default raised to 4096: 2200 often truncates large TSX components mid-tag
+  const maxOutputTokens = readNumber("AI_MAX_OUTPUT_TOKENS", 4096);
   const temperature = readOptionalNumber("ANTHROPIC_TEMPERATURE");
 
   let previousOut = "";
@@ -1099,18 +1229,36 @@ async function main() {
         mustEnv("ANTHROPIC_API_KEY");
       }
 
-      const extraRules =
-        attempt === 1
-          ? ""
-          : [
-              "Your previous output was invalid or failed quality gates.",
-              "Regenerate a correct unified diff with full headers and at least one @@ hunk per file.",
-              "Output ONE diff block only. No duplicate file diffs.",
-              "Prefer minimal hunks; do not replace whole files unless required.",
-              "Reminder: no @testing-library/*, no toBeInTheDocument, no app/**/__tests__.",
-              "Most important: the patch MUST apply cleanly to the provided REPO_SNAPSHOT.",
-              "Context lines in hunks must EXACTLY match the file contents shown in REPO_SNAPSHOT.",
-            ].join(" ");
+      // Build extraRules: include lint error context if available
+      let extraRules = "";
+      if (attempt > 1) {
+        const baseFix = [
+          "Your previous output was invalid or failed quality gates.",
+          "Regenerate a correct unified diff with full headers and at least one @@ hunk per file.",
+          "Output ONE diff block only. No duplicate file diffs.",
+          "Prefer minimal hunks; do not replace whole files unless required.",
+          "Reminder: no @testing-library/*, no toBeInTheDocument, no app/**/__tests__.",
+          "Most important: the patch MUST apply cleanly to the provided REPO_SNAPSHOT.",
+          "Context lines in hunks must EXACTLY match the file contents shown in REPO_SNAPSHOT.",
+        ];
+
+        // If previous failure was a lint error, add very specific instructions
+        if (previousOut && previousOut.includes("LINT/TYPECHECK ERRORS")) {
+          baseFix.push(
+            "",
+            "CRITICAL: The previous patch had SYNTAX ERRORS in the generated code.",
+            "Before outputting the diff, mentally verify that:",
+            "  1. Every opened JSX tag (<div>, <label>, etc.) has a matching closing tag.",
+            "  2. Every string literal is properly terminated.",
+            "  3. Every function/block has matching braces {}.",
+            "  4. All imports are syntactically correct.",
+            "  5. The complete file, after applying your diff, would be valid TypeScript/TSX.",
+            "If the component is large, consider generating it in smaller focused hunks.",
+          );
+        }
+
+        extraRules = baseFix.join(" ");
+      }
 
       await cleanupArtifacts();
 
@@ -1146,11 +1294,43 @@ async function main() {
           tail(gatesLog, 220),
         ].join("\n");
 
+        // ★ Extract lint errors for next attempt's extra rules
+        const lintFixInstructions = buildLintFixInstructions(gatesLog);
+        if (lintFixInstructions) {
+          // Store lint feedback so next attempt gets it as explicit instructions
+          previousOut = lintFixInstructions + "\n\n";
+        } else {
+          previousOut = "";
+        }
+
         try {
           const last = await fs.readFile(LAST_OUTPUT_PATH, "utf8");
-          previousOut = `${last}\n\n${debug}\n`;
+          previousOut += `${last}\n\n${debug}\n`;
         } catch {
-          previousOut = debug;
+          previousOut += debug;
+        }
+
+        // ★ If lint failed on a specific file, try to build a snapshot of
+        //   what the file looked like AFTER the patch (the broken version)
+        //   so the model can see exactly what code it generated
+        const errorFile = extractErrorFile(gatesLog);
+        if (errorFile) {
+          // The patch was already applied (dry-run applies then rolls back)
+          // but we still have patch.diff — parse the generated file content from it
+          try {
+            const patchContent = await fs.readFile(PATCH_PATH, "utf8");
+            if (patchContent.includes(errorFile)) {
+              failureSnapshot = [
+                failureSnapshot || "",
+                `## LINT_FAILED_FILE: ${errorFile}`,
+                "The diff you generated for this file caused lint errors.",
+                "Check that all JSX tags are closed, all strings are terminated,",
+                "and the code is syntactically valid TypeScript/JSX.",
+              ].join("\n");
+            }
+          } catch {
+            // ignore
+          }
         }
 
         if (attempt === MAX_ATTEMPTS)
