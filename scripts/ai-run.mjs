@@ -86,6 +86,244 @@ function extractAllCodeBlocks(text, lang) {
   return blocks;
 }
 
+// ─────────────────────────────────────────────────────────────
+// ★ NEW: Salvage parser — extract diff even without fenced blocks
+// ─────────────────────────────────────────────────────────────
+
+/**
+ * Try multiple strategies to extract a unified diff from raw model output.
+ * Returns the best diff string found, or null.
+ */
+function salvageDiff(rawOutput) {
+  // Strategy 1: standard fenced ```diff blocks
+  const fencedDiff = extractAllCodeBlocks(rawOutput, "diff");
+  if (fencedDiff.length) {
+    const best = pickBestDiff(fencedDiff);
+    if (best && looksLikeUnifiedDiff(best)) return best;
+  }
+
+  // Strategy 2: fenced blocks with other lang tags that contain diff content
+  // e.g. ```patch, ```text, ```shell, ```plaintext, ```, ```unified
+  const anyFenced = extractAllCodeBlocks(rawOutput, "[a-zA-Z]*");
+  for (const block of anyFenced) {
+    if (looksLikeUnifiedDiff(block)) return block;
+  }
+
+  // Strategy 2b: bare fenced blocks (``` with no lang tag)
+  const bareFenced = [];
+  const bareRe = /```\n([\s\S]*?)\n```/gm;
+  let bm;
+  while ((bm = bareRe.exec(rawOutput)) !== null) {
+    bareFenced.push(bm[1].trimEnd());
+  }
+  for (const block of bareFenced) {
+    if (looksLikeUnifiedDiff(block)) return block;
+  }
+
+  // Strategy 3: raw unfenced diff — find "diff --git" and collect until end or next prose
+  const lines = rawOutput.split("\n");
+  let diffStart = -1;
+  let diffEnd = -1;
+  for (let i = 0; i < lines.length; i++) {
+    if (lines[i].startsWith("diff --git ")) {
+      if (diffStart === -1) diffStart = i;
+      diffEnd = i;
+    } else if (diffStart !== -1) {
+      // Continue collecting diff-related lines
+      const l = lines[i];
+      if (
+        l.startsWith("--- ") ||
+        l.startsWith("+++ ") ||
+        l.startsWith("@@ ") ||
+        l.startsWith("+") ||
+        l.startsWith("-") ||
+        l.startsWith(" ") ||
+        l.startsWith("index ") ||
+        l.startsWith("new file mode") ||
+        l.startsWith("deleted file mode") ||
+        l.startsWith("old mode") ||
+        l.startsWith("new mode") ||
+        l.startsWith("rename from") ||
+        l.startsWith("rename to") ||
+        l.startsWith("similarity index") ||
+        l.startsWith("Binary files") ||
+        l === "" ||
+        l === "\\ No newline at end of file"
+      ) {
+        diffEnd = i;
+      } else {
+        // Possibly prose or explanation — stop if we've accumulated enough
+        // But peek ahead: if another "diff --git" comes soon, keep going
+        let nextDiff = -1;
+        for (let j = i; j < Math.min(i + 5, lines.length); j++) {
+          if (lines[j].startsWith("diff --git ")) {
+            nextDiff = j;
+            break;
+          }
+        }
+        if (nextDiff === -1) break;
+        // skip intervening prose
+      }
+    }
+  }
+
+  if (diffStart !== -1 && diffEnd > diffStart) {
+    const extracted = lines.slice(diffStart, diffEnd + 1).join("\n");
+    if (looksLikeUnifiedDiff(extracted)) return extracted;
+  }
+
+  return null;
+}
+
+/**
+ * Try multiple strategies to extract a PR body (markdown) from raw model output.
+ * Returns the best markdown string found, or a generated placeholder.
+ */
+function salvagePrBody(rawOutput, task) {
+  // Strategy 1: standard fenced ```md / ```markdown / ```mdx blocks
+  const mdBlocks = [
+    ...extractAllCodeBlocks(rawOutput, "md"),
+    ...extractAllCodeBlocks(rawOutput, "markdown"),
+    ...extractAllCodeBlocks(rawOutput, "mdx"),
+  ];
+  const best = pickBestMd(mdBlocks);
+  if (best) return best;
+
+  // Strategy 2: look for PR-body-like headings in the raw text
+  const headingPatterns = [
+    /^#{1,3}\s*Summary/im,
+    /^#{1,3}\s*How to test/im,
+    /^#{1,3}\s*Description/im,
+    /^#{1,3}\s*Changes/im,
+    /^#{1,3}\s*What/im,
+  ];
+
+  for (const pat of headingPatterns) {
+    const match = rawOutput.match(pat);
+    if (match) {
+      const idx = rawOutput.indexOf(match[0]);
+      // Extract from heading to the end of text or next diff block
+      let endIdx = rawOutput.length;
+      const nextDiff = rawOutput.indexOf("diff --git", idx);
+      const nextFence = rawOutput.indexOf("```", idx + 10);
+      if (nextDiff > idx) endIdx = Math.min(endIdx, nextDiff);
+      if (nextFence > idx) endIdx = Math.min(endIdx, nextFence);
+      const section = rawOutput.slice(idx, endIdx).trim();
+      if (section.length > 50) return section;
+    }
+  }
+
+  // Strategy 3: generate a minimal placeholder from task
+  const taskFirstLine = (task || "AI-generated changes")
+    .split("\n")
+    .find((l) => l.trim())
+    ?.trim()
+    ?.slice(0, 120);
+  return [
+    "## Summary",
+    "",
+    taskFirstLine || "Apply changes as specified in TASK.",
+    "",
+    "## How to test",
+    "",
+    "- `pnpm test`",
+    "- `pnpm typecheck`",
+    "",
+    "## Risk & rollback",
+    "",
+    "Low risk. Revert the PR commit.",
+    "",
+    "## Notes",
+    "",
+    "PR body auto-generated (model output did not include a proper md block).",
+  ].join("\n");
+}
+
+// ─────────────────────────────────────────────────────────────
+// ★ NEW: OpenAI format-repair retry
+// ─────────────────────────────────────────────────────────────
+
+/**
+ * If OpenAI's output failed parsing, send a repair prompt to OpenAI
+ * with the bad output, asking it to re-emit just the two code blocks.
+ * Returns the repaired output text, or null if repair also fails.
+ */
+async function openaiFormatRepair({
+  apiKey,
+  model,
+  badOutput,
+  maxTokens,
+}) {
+  const repairPrompt = [
+    "Your previous output did not follow the required format.",
+    "I need EXACTLY two fenced code blocks and nothing else:",
+    "",
+    "1) A ```diff block containing a valid unified diff (git diff format).",
+    "2) A ```md block containing the PR body in Markdown.",
+    "",
+    "No explanations, no extra text outside the two blocks.",
+    "",
+    "Here is your previous output. Extract and re-format it correctly:",
+    "",
+    "---BEGIN PREVIOUS OUTPUT---",
+    badOutput.slice(0, 12000), // limit to avoid token overflow
+    "---END PREVIOUS OUTPUT---",
+    "",
+    "Now output ONLY the two fenced code blocks (```diff and ```md).",
+  ].join("\n");
+
+  try {
+    console.log("[ai:run] attempting OpenAI format-repair...");
+    const repaired = await openaiResponsesCreate({
+      apiKey,
+      model,
+      system:
+        "You are a formatting assistant. Re-emit the user's content as exactly two fenced code blocks: one ```diff and one ```md. No extra text.",
+      userText: repairPrompt,
+      maxTokens,
+    });
+    return repaired || null;
+  } catch (e) {
+    console.warn("[ai:run] format-repair call failed:", e?.message);
+    return null;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────
+// ★ NEW: Patch auto-fix — try --recount, fuzzy, and strip whitespace
+// ─────────────────────────────────────────────────────────────
+
+/**
+ * Try progressively more lenient git apply strategies.
+ * Returns { ok: boolean, stderr: string }.
+ */
+function tryGitApply(patchPath) {
+  // Attempt 1: normal (with --recount)
+  const strategies = [
+    ["--check", "--recount", "--whitespace=nowarn", "-p1"],
+    ["--check", "--recount", "--whitespace=fix", "-p1"],
+    ["--check", "--recount", "--whitespace=nowarn", "-p1", "-C1"],  // reduce context requirement
+  ];
+
+  for (const args of strategies) {
+    const chk = runCapture("git", ["apply", ...args, patchPath]);
+    if (chk.status === 0) return { ok: true, stderr: "" };
+  }
+
+  // Return the last error for diagnosis
+  const lastCheck = runCapture("git", [
+    "apply",
+    "--check",
+    "--recount",
+    "--whitespace=nowarn",
+    "-p1",
+    patchPath,
+  ]);
+  return { ok: false, stderr: lastCheck.stderr };
+}
+
+// ─────────────────────────────────────────────────────────────
+
 function pickBestDiff(blocks) {
   if (!blocks.length) return null;
   // 가장 긴 diff를 선택 (대체로 완성본일 확률 높음)
@@ -431,6 +669,8 @@ async function openaiResponsesCreate({
     ],
   };
 
+  // ★ temperature를 절대 보내지 않음 — 일부 OpenAI 모델(o1, o3 등)이 400을 냄
+  // max_output_tokens도 모델별로 조심
   if (typeof maxTokens === "number") body.max_output_tokens = maxTokens;
 
   const res = await fetch(`${OPENAI_BASE_URL}/responses`, {
@@ -527,18 +767,35 @@ async function callAgent({
       ].join("\n")
     : "";
 
+  // ★ OpenAI-specific format reinforcement (더 강하게 제약)
+  const formatReinforcement =
+    provider === "openai"
+      ? [
+          "",
+          "CRITICAL FORMAT RULES (you MUST follow these exactly):",
+          "- Your entire response must contain EXACTLY two fenced code blocks.",
+          '- The first block MUST start with ```diff and end with ```',
+          '- The second block MUST start with ```md and end with ```',
+          "- Do NOT output ANY text before the first ``` or after the last ```.",
+          "- Do NOT use ```patch, ```text, ```shell, or any other language tag for the diff.",
+          "- Do NOT output the diff as plain text without fences.",
+          "",
+        ].join("\n")
+      : "";
+
   const baseRules = [
     "You are an agentic coding system that must produce a single-PR sized change.",
     "Return EXACTLY two blocks and nothing else:",
     "1) One unified diff inside a single ```diff code block.",
     "2) One PR body inside a single ```md code block (Summary / How to test / Risk & rollback / Notes).",
     "Do not output any text outside the two fenced code blocks.",
-    "",
+    formatReinforcement,
     "Hard requirements for the diff:",
     "- Must be valid `git diff` unified patch format: include `diff --git`, `---`, `+++`, and `@@` hunks.",
     "- Output ONE diff block only. No duplicate `diff --git` for same file.",
     "- Do NOT delete+recreate the same file in two separate diff entries.",
     "- Prefer small, minimal hunks. Do NOT replace entire files unless TASK requires.",
+    "- Context lines in the diff MUST exactly match the REPO_SNAPSHOT files provided below.",
     "",
     "Constraints:",
     "- Keep changes minimal; no large refactors, no mass formatting.",
@@ -615,6 +872,14 @@ async function callAgent({
   await fs.mkdir(".ai", { recursive: true });
   await fs.writeFile(LAST_OUTPUT_PATH, out, "utf8");
 
+  // ─────────────────────────────────────────────────────────
+  // ★ CHANGED: robust extraction with salvage fallback
+  // ─────────────────────────────────────────────────────────
+
+  let diff = null;
+  let prBodyEn = null;
+
+  // Step A: try standard extraction first
   const diffBlocks = extractAllCodeBlocks(out, "diff");
   const mdBlocks = [
     ...extractAllCodeBlocks(out, "md"),
@@ -622,9 +887,73 @@ async function callAgent({
     ...extractAllCodeBlocks(out, "mdx"),
   ];
 
-  const diff = pickBestDiff(diffBlocks);
-  const prBodyEn = pickBestMd(mdBlocks);
+  diff = pickBestDiff(diffBlocks);
+  prBodyEn = pickBestMd(mdBlocks);
 
+  // Step B: if standard parsing failed, try salvage
+  if (!diff || !looksLikeUnifiedDiff(diff)) {
+    console.log("[ai:run] standard diff extraction failed, trying salvage...");
+    const salvaged = salvageDiff(out);
+    if (salvaged) {
+      console.log("[ai:run] salvage parser recovered a valid diff");
+      diff = salvaged;
+    }
+  }
+
+  if (!prBodyEn) {
+    console.log("[ai:run] standard md extraction failed, trying salvage...");
+    prBodyEn = salvagePrBody(out, task);
+    console.log("[ai:run] salvage parser generated PR body");
+  }
+
+  // Step C: if still no diff AND provider is OpenAI, try format-repair call
+  if ((!diff || !looksLikeUnifiedDiff(diff)) && provider === "openai") {
+    console.log(
+      "[ai:run] diff still missing after salvage, attempting OpenAI format-repair...",
+    );
+    const repaired = await openaiFormatRepair({
+      apiKey: mustEnv("OPENAI_API_KEY"),
+      model,
+      badOutput: out,
+      maxTokens: maxOutputTokens,
+    });
+
+    if (repaired) {
+      // Append repair output to last-output for debugging
+      await fs.writeFile(
+        LAST_OUTPUT_PATH,
+        out + "\n\n# FORMAT_REPAIR_OUTPUT\n" + repaired,
+        "utf8",
+      );
+
+      // Try standard extraction on repaired output
+      const repairedDiffBlocks = extractAllCodeBlocks(repaired, "diff");
+      const repairedDiff = pickBestDiff(repairedDiffBlocks);
+      if (repairedDiff && looksLikeUnifiedDiff(repairedDiff)) {
+        console.log("[ai:run] format-repair recovered a valid diff");
+        diff = repairedDiff;
+      } else {
+        // Try salvage on repaired too
+        const salvagedRepair = salvageDiff(repaired);
+        if (salvagedRepair) {
+          console.log("[ai:run] salvage on repaired output recovered diff");
+          diff = salvagedRepair;
+        }
+      }
+
+      // Also try to get PR body from repaired output if still missing meaningful content
+      if (!prBodyEn || prBodyEn.includes("auto-generated")) {
+        const repairedMd = [
+          ...extractAllCodeBlocks(repaired, "md"),
+          ...extractAllCodeBlocks(repaired, "markdown"),
+        ];
+        const repairedBody = pickBestMd(repairedMd);
+        if (repairedBody) prBodyEn = repairedBody;
+      }
+    }
+  }
+
+  // Final validation
   if (!diff) throw new Error(`No diff block found. See ${LAST_OUTPUT_PATH}`);
   if (!prBodyEn)
     throw new Error(`No md PR body block found. See ${LAST_OUTPUT_PATH}`);
@@ -664,20 +993,16 @@ async function callAgent({
   });
   await fs.writeFile(PR_BODY_PATH, koBody + "\n", "utf8");
 
-  // check patch applicability
-  const chk = runCapture("git", [
-    "apply",
-    "--check",
-    "--recount",
-    "--whitespace=nowarn",
-    "-p1",
-    PATCH_PATH,
-  ]);
+  // ─────────────────────────────────────────────────────────
+  // ★ CHANGED: use lenient tryGitApply instead of single check
+  // ─────────────────────────────────────────────────────────
 
-  if (chk.status !== 0) {
-    const debug = `\n\n# GIT_APPLY_CHECK_FAILED\n${chk.stderr}\n`;
+  const applyResult = tryGitApply(PATCH_PATH);
+
+  if (!applyResult.ok) {
+    const debug = `\n\n# GIT_APPLY_CHECK_FAILED\n${applyResult.stderr}\n`;
     await fs.writeFile(LAST_OUTPUT_PATH, out + debug, "utf8");
-    const failed = parseFailedPathsFromGitApply(chk.stderr);
+    const failed = parseFailedPathsFromGitApply(applyResult.stderr);
     const failedList = failed.length
       ? `\nFailed paths:\n- ${failed.join("\n- ")}`
       : "";
@@ -738,17 +1063,39 @@ async function main() {
 
   const repoSnapshot = await buildRepoSnapshot(requiredFiles);
 
-  for (let attempt = 1; attempt <= 3; attempt++) {
+  // ★ CHANGED: 4 attempts total — attempt 1: OpenAI, attempt 2: OpenAI retry
+  //   (only if attempt 1 was a parse/format failure, not a policy violation),
+  //   attempt 3-4: Claude fix/review
+  const MAX_ATTEMPTS = 4;
+  let openaiFormatFailed = false;
+
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
     try {
-      // attempt 1: OpenAI (code). attempt 2-3: Anthropic (fix/review)
-      const provider = attempt === 1 ? "openai" : "anthropic";
+      // Decide provider:
+      //   attempt 1: always OpenAI
+      //   attempt 2: OpenAI retry if format failure, otherwise Claude
+      //   attempt 3+: always Claude
+      let provider;
+      if (attempt === 1) {
+        provider = "openai";
+      } else if (attempt === 2 && openaiFormatFailed) {
+        provider = "openai";
+        console.log(
+          "[ai:run] retrying OpenAI (attempt 2) due to format failure...",
+        );
+      } else {
+        provider = "anthropic";
+      }
+
       const model = provider === "openai" ? openaiModel : claudeModel;
 
       if (provider === "openai") {
-        console.log("[ai:run] calling OpenAI (code)...");
+        console.log(`[ai:run] calling OpenAI (code), attempt ${attempt}...`);
         mustEnv("OPENAI_API_KEY");
       } else {
-        console.log("[ai:run] calling Claude (Anthropic) for fix/review...");
+        console.log(
+          `[ai:run] calling Claude (Anthropic) for fix/review, attempt ${attempt}...`,
+        );
         mustEnv("ANTHROPIC_API_KEY");
       }
 
@@ -762,6 +1109,7 @@ async function main() {
               "Prefer minimal hunks; do not replace whole files unless required.",
               "Reminder: no @testing-library/*, no toBeInTheDocument, no app/**/__tests__.",
               "Most important: the patch MUST apply cleanly to the provided REPO_SNAPSHOT.",
+              "Context lines in hunks must EXACTLY match the file contents shown in REPO_SNAPSHOT.",
             ].join(" ");
 
       await cleanupArtifacts();
@@ -805,7 +1153,7 @@ async function main() {
           previousOut = debug;
         }
 
-        if (attempt === 3)
+        if (attempt === MAX_ATTEMPTS)
           throw new Error(`Dry-run failed. See ${GATES_LOG_PATH}`);
         continue;
       }
@@ -815,6 +1163,16 @@ async function main() {
     } catch (e) {
       const msg = e?.message || String(e || "");
       console.error(`[ai:run] attempt ${attempt} failed:`, msg);
+
+      // Track if this was a format/parse failure (for OpenAI retry logic)
+      if (
+        attempt === 1 &&
+        (msg.includes("No diff block found") ||
+          msg.includes("No md PR body block found") ||
+          msg.includes("Invalid unified diff"))
+      ) {
+        openaiFormatFailed = true;
+      }
 
       try {
         const last = await fs.readFile(LAST_OUTPUT_PATH, "utf8");
@@ -848,13 +1206,13 @@ async function main() {
         }
       }
 
-      if (attempt === 3) throw e;
+      if (attempt === MAX_ATTEMPTS) throw e;
     }
   }
 
   if (!success) {
     throw new Error(
-      `[ai:run] failed: could not generate a valid diff+md after 3 attempts. See ${LAST_OUTPUT_PATH}`,
+      `[ai:run] failed: could not generate a valid diff+md after ${MAX_ATTEMPTS} attempts. See ${LAST_OUTPUT_PATH}`,
     );
   }
 
