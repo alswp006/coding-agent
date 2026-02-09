@@ -85,14 +85,6 @@ function extractAllCodeBlocks(text, lang) {
   return blocks;
 }
 
-function extractAllCodeBlocksAnyLang(text, langs) {
-  const blocks = [];
-  for (const l of langs) {
-    blocks.push(...extractAllCodeBlocks(text, l));
-  }
-  return blocks;
-}
-
 function pickBestDiff(blocks) {
   if (!blocks.length) return null;
   let best = blocks[0];
@@ -108,143 +100,33 @@ function pickBestMd(blocks) {
   return first.length >= 200 ? first : longest;
 }
 
-function normalizeNewlines(s) {
-  return String(s || "").replace(/\r\n/g, "\n");
-}
-
 /**
- * Fallback diff extraction:
- * - If model didn't use ```diff fences, try to locate the first "diff --git" block.
- * - Stop at the start of the PR body fence if present.
- */
-function extractUnifiedDiffFromLooseText(text) {
-  const t = normalizeNewlines(text);
-
-  // If there is a fenced diff-like block but with wrong tag, strip fences first
-  const fenceRe = /```[a-zA-Z0-9_-]*\n([\s\S]*?)\n```/g;
-  const candidates = [];
-  let m;
-  while ((m = fenceRe.exec(t)) !== null) {
-    const body = (m[1] || "").trimEnd();
-    if (/^diff --git /m.test(body)) candidates.push(body);
-  }
-  if (candidates.length) {
-    const best = pickBestDiff(candidates);
-    return best && looksLikeUnifiedDiff(best) ? best : best;
-  }
-
-  const idx = t.search(/^diff --git /m);
-  if (idx === -1) return null;
-
-  // cut from idx to end
-  let diff = t.slice(idx).trimEnd();
-
-  // If an md fence exists after, cut before it
-  const mdFenceIdx = diff.search(/^```(md|markdown|mdx)\b/m);
-  if (mdFenceIdx !== -1) diff = diff.slice(0, mdFenceIdx).trimEnd();
-
-  // If another random prose section like "```md" isn't present but "```" appears, don't cut blindly.
-  return diff;
-}
-
-/**
- * Fallback PR body extraction:
- * - If no md fenced block, attempt to use remaining text after diff block.
- * - Or synthesize a minimal PR body to satisfy ai-pr.
- */
-function extractPrBodyFromLooseText(text) {
-  const t = normalizeNewlines(text);
-
-  // 1) If there is any fenced md/markdown/mdx block, prefer it (caller already tries that)
-  // 2) Try to find content after the last triple backtick that contains diff
-  const lastDiffIdx = t.lastIndexOf("diff --git ");
-  if (lastDiffIdx !== -1) {
-    // find end of diff-ish region: if there is a closing fence after it, take after fence
-    const after = t.slice(lastDiffIdx);
-    const closeFence = after.indexOf("```");
-    if (closeFence !== -1) {
-      // skip first fence maybe; just take everything after the next closing fence
-      const afterClose = after.slice(closeFence + 3);
-      const maybe = afterClose.trim();
-      if (maybe.length >= 120) return maybe;
-    }
-  }
-
-  // 3) Use whole text if it's reasonably long and not a diff
-  if (!/^diff --git /m.test(t) && t.trim().length >= 200) return t.trim();
-
-  // 4) Synthesize minimal body (always valid)
-  return [
-    "## Summary",
-    "- Apply AI-generated patch for the current TASK.",
-    "",
-    "## How to test",
-    "```bash",
-    "pnpm test",
-    "pnpm lint",
-    "pnpm typecheck",
-    "pnpm format:check",
-    "```",
-    "",
-    "## Risk & rollback",
-    "- Low risk (scaffold-level). Roll back by reverting this PR.",
-    "",
-    "## Notes",
-    "- No API call should be triggered by the UI action in this packet.",
-  ].join("\n");
-}
-
-/**
- * Parse TASK.md for required files.
- * Supports BOTH:
- * 1) Markdown section:
- *    ## Files to create
- *    - path
- * 2) JSON task:
- *    { "files": ["path1", ...] } OR { "task": { "files": [...] } }
+ * Parse TASK.md for "Files to create" section.
+ * Expected format:
+ * ## Files to create
+ * - path
+ * - path
  */
 function parseRequiredFilesFromTask(taskText) {
-  // 1) Markdown section "## Files to create"
-  {
-    const lines = taskText.split("\n");
-    const required = [];
+  const lines = taskText.split("\n");
+  const required = [];
 
-    let inSection = false;
-    for (const raw of lines) {
-      const line = raw.trim();
+  let inSection = false;
+  for (const raw of lines) {
+    const line = raw.trim();
 
-      if (/^##\s+Files to create\s*$/i.test(line)) {
-        inSection = true;
-        continue;
-      }
-      if (inSection && /^##\s+/.test(line)) break;
-      if (!inSection) continue;
-
-      const m = line.match(/^-\s+(.+)$/);
-      if (m) required.push(m[1].trim());
+    if (/^##\s+Files to create\s*$/i.test(line)) {
+      inSection = true;
+      continue;
     }
+    if (inSection && /^##\s+/.test(line)) break;
+    if (!inSection) continue;
 
-    if (required.length) return required.map((p) => p.replace(/\*\*/g, ""));
+    const m = line.match(/^-\s+(.+)$/);
+    if (m) required.push(m[1].trim());
   }
 
-  // 2) JSON 형태 지원
-  try {
-    const j = JSON.parse(taskText);
-    const files = Array.isArray(j?.files)
-      ? j.files
-      : Array.isArray(j?.task?.files)
-        ? j.task.files
-        : [];
-    if (files.length) {
-      return files
-        .filter((x) => typeof x === "string" && x.trim())
-        .map((p) => String(p).trim().replace(/\*\*/g, ""));
-    }
-  } catch {
-    // ignore
-  }
-
-  return [];
+  return required.map((p) => p.replace(/\*\*/g, ""));
 }
 
 function mustIncludeRequiredFiles(diff, requiredPaths) {
@@ -265,70 +147,6 @@ function mustIncludeRequiredFiles(diff, requiredPaths) {
 }
 
 // -----------------------------
-// Patch helpers (for apply-fail recovery)
-// -----------------------------
-
-function parseTouchedPathsFromDiff(diff) {
-  const out = [];
-  const re = /^diff --git a\/(.+?) b\/(.+?)$/gm;
-  let m;
-  while ((m = re.exec(diff)) !== null) {
-    out.push({ aPath: m[1], bPath: m[2] });
-  }
-  return out;
-}
-
-async function buildCurrentFileContextFromDiff(diff) {
-  const touched = parseTouchedPathsFromDiff(diff);
-  const unique = new Map();
-
-  for (const t of touched) {
-    const p =
-      t.bPath && t.bPath !== "/dev/null"
-        ? t.bPath
-        : t.aPath && t.aPath !== "/dev/null"
-          ? t.aPath
-          : null;
-    if (!p) continue;
-    if (unique.has(p)) continue;
-    unique.set(p, true);
-  }
-
-  const paths = [...unique.keys()];
-  if (!paths.length) return "";
-
-  const chunks = [];
-  for (const p of paths) {
-    if (!existsSync(p)) {
-      chunks.push(`## ${p}\n(does not exist in worktree)\n`);
-      continue;
-    }
-    const content = await fs.readFile(p, "utf8").catch(() => "");
-    const clipped =
-      content.length > 30_000
-        ? content.slice(0, 30_000) + "\n\n/* [TRUNCATED] */\n"
-        : content;
-
-    const lang =
-      p.endsWith(".ts") || p.endsWith(".mts")
-        ? "ts"
-        : p.endsWith(".tsx")
-          ? "tsx"
-          : p.endsWith(".js") || p.endsWith(".mjs")
-            ? "js"
-            : p.endsWith(".md")
-              ? "md"
-              : "";
-
-    chunks.push(
-      [`## ${p}`, "```" + lang, clipped.trimEnd(), "```", ""].join("\n"),
-    );
-  }
-
-  return ["# CURRENT_WORKTREE_FILE_SNAPSHOTS", "", ...chunks].join("\n");
-}
-
-// -----------------------------
 // Policy / Forbidden guards
 // -----------------------------
 
@@ -338,6 +156,7 @@ function assertPatchPolicy({
   forbidReactTestingLib = true,
   forbidAppDraftsTests = true,
 }) {
+  // 1) vitest config 중복/변형 방지
   const forbiddenVitestConfigs = [
     "vitest.config.ts",
     "vitest.config.js",
@@ -359,6 +178,7 @@ function assertPatchPolicy({
     }
   }
 
+  // 2) app/drafts/** 테스트 추가 금지
   if (forbidAppDraftsTests) {
     const re =
       /^diff --git a\/app\/drafts\/.*__tests__\/.* b\/app\/drafts\/.*__tests__\/.*/m;
@@ -369,6 +189,7 @@ function assertPatchPolicy({
     }
   }
 
+  // 3) Testing Library import 금지
   if (forbidReactTestingLib) {
     const re = /@testing-library\/react/;
     if (re.test(diff)) {
@@ -378,6 +199,7 @@ function assertPatchPolicy({
     }
   }
 
+  // 4) package.json 변경 금지 (Task가 허용할 때만)
   const pkgRe = /^diff --git a\/package\.json b\/package\.json/m;
   if (pkgRe.test(diff)) {
     throw new Error(
@@ -428,6 +250,7 @@ function assertNoForbiddenDiff(diff) {
 }
 
 function assertDoNotTouchUnlessTask({ diff, taskText, allowedPaths }) {
+  // 보호 파일: 코더가 괜히 건드리면 patch apply conflict / 의미 없는 변경이 자주 발생
   const protectedPaths = ["src/__tests__/smoke.test.ts"];
 
   for (const p of protectedPaths) {
@@ -445,22 +268,8 @@ function assertDoNotTouchUnlessTask({ diff, taskText, allowedPaths }) {
   }
 }
 
-function assertNoRootPageEditsWhenDraftRoute(taskText, diff) {
-  const mentionsDraftRoute =
-    /\/drafts\/new/i.test(taskText) || /\bdrafts\/new\b/i.test(taskText);
-
-  if (!mentionsDraftRoute) return;
-
-  const rootPageRe = /^diff --git a\/app\/page\.tsx b\/app\/page\.tsx$/m;
-  if (rootPageRe.test(diff)) {
-    throw new Error(
-      `Policy violation: TASK references /drafts/new, so do NOT modify app/page.tsx. Implement page under app/drafts/new/page.tsx instead.`,
-    );
-  }
-}
-
 // -----------------------------
-// Anthropic API
+// Anthropic API (Fix/Review only)
 // -----------------------------
 async function anthropicMessagesCreate({
   apiKey,
@@ -507,47 +316,28 @@ async function anthropicMessagesCreate({
 }
 
 // -----------------------------
-// OpenAI API (Responses)
+// OpenAI API (Code + Translate)
 // -----------------------------
-function extractOpenAIText(json) {
-  const out = [];
-
-  if (typeof json?.output_text === "string" && json.output_text.trim()) {
-    out.push(json.output_text);
-  }
-
-  const output = Array.isArray(json?.output) ? json.output : [];
-  for (const o of output) {
-    const content = Array.isArray(o?.content) ? o.content : [];
-    for (const c of content) {
-      if (c && c.type === "output_text" && typeof c.text === "string")
-        out.push(c.text);
-      if (c && c.type === "text" && typeof c.text === "string")
-        out.push(c.text);
-    }
-    if (o && o.type === "output_text" && typeof o.text === "string")
-      out.push(o.text);
-  }
-
-  return out.join("").trim();
-}
-
 async function openaiResponsesCreate({
   apiKey,
   model,
   system,
   userText,
   maxTokens,
-  temperature,
+  // NOTE: DO NOT accept or forward "temperature" here.
+  // Some models reject it and will 400.
 }) {
   const body = {
     model,
-    input: String(userText || ""),
+    input: [
+      ...(system && String(system).trim()
+        ? [{ role: "system", content: String(system) }]
+        : []),
+      { role: "user", content: String(userText || "") },
+    ],
   };
 
-  if (system && String(system).trim()) body.instructions = String(system);
   if (typeof maxTokens === "number") body.max_output_tokens = maxTokens;
-  if (typeof temperature === "number") body.temperature = temperature;
 
   const res = await fetch(`${OPENAI_BASE_URL}/responses`, {
     method: "POST",
@@ -567,7 +357,17 @@ async function openaiResponsesCreate({
     );
   }
 
-  return String(extractOpenAIText(json) || "");
+  const output = Array.isArray(json?.output) ? json.output : [];
+  const text = output
+    .flatMap((o) => (Array.isArray(o?.content) ? o.content : []))
+    .filter((c) => c && c.type === "output_text" && typeof c.text === "string")
+    .map((c) => c.text)
+    .join("");
+
+  const fallbackText =
+    typeof json?.output_text === "string" ? json.output_text : "";
+
+  return String(text || fallbackText || "");
 }
 
 async function translatePrBodyToKorean({ model, text }) {
@@ -586,7 +386,6 @@ async function translatePrBodyToKorean({ model, text }) {
       system: instructions,
       userText: text,
       maxTokens: 1200,
-      temperature: 0,
     })
   ).trimEnd();
 
@@ -604,7 +403,6 @@ async function callAgent({
   extraRules,
   attempt,
   previousOut,
-  extraContext,
 }) {
   const diffTemplate = [
     "Here is a minimal valid example of a NEW FILE diff. Follow this format exactly:",
@@ -685,10 +483,6 @@ async function callAgent({
     );
   }
 
-  if (extraContext) {
-    inputParts.push("\n\n", extraContext);
-  }
-
   const userText = inputParts.join("");
   let out = "";
 
@@ -699,7 +493,7 @@ async function callAgent({
       system: instructions,
       userText,
       maxTokens: maxOutputTokens,
-      temperature: typeof temperature === "number" ? temperature : 0, // OpenAI는 0이 안정적
+      // IMPORTANT: do not pass temperature
     });
   } else {
     out = await anthropicMessagesCreate({
@@ -715,26 +509,19 @@ async function callAgent({
   await fs.mkdir(".ai", { recursive: true });
   await fs.writeFile(LAST_OUTPUT_PATH, out, "utf8");
 
-  // ---- DIFF extraction: accept diff/patch/git/udiff + fallback to loose text
-  const diffBlocks = extractAllCodeBlocksAnyLang(out, [
-    "diff",
-    "patch",
-    "git",
-    "gitdiff",
-    "udiff",
-    "unified-diff",
-  ]);
-  const mdBlocks = extractAllCodeBlocksAnyLang(out, ["md", "markdown", "mdx"]);
+  const diffBlocks = extractAllCodeBlocks(out, "diff");
+  const mdBlocks = [
+    ...extractAllCodeBlocks(out, "md"),
+    ...extractAllCodeBlocks(out, "markdown"),
+    ...extractAllCodeBlocks(out, "mdx"),
+  ];
 
-  let diff = pickBestDiff(diffBlocks);
-  let prBodyEn = pickBestMd(mdBlocks);
-
-  if (!diff) diff = extractUnifiedDiffFromLooseText(out);
-  if (!prBodyEn) prBodyEn = extractPrBodyFromLooseText(out);
+  const diff = pickBestDiff(diffBlocks);
+  const prBodyEn = pickBestMd(mdBlocks);
 
   if (!diff) throw new Error(`No diff block found. See ${LAST_OUTPUT_PATH}`);
   if (!prBodyEn)
-    throw new Error(`No md PR body found. See ${LAST_OUTPUT_PATH}`);
+    throw new Error(`No md PR body block found. See ${LAST_OUTPUT_PATH}`);
   if (!looksLikeUnifiedDiff(diff)) {
     throw new Error(
       `Invalid unified diff (missing headers or @@ hunk). See ${LAST_OUTPUT_PATH}`,
@@ -751,7 +538,6 @@ async function callAgent({
     taskText: task,
     allowedPaths: requiredFiles,
   });
-  assertNoRootPageEditsWhenDraftRoute(task, diff);
 
   // policy gate
   assertPatchPolicy({
@@ -805,7 +591,9 @@ function tail(text, lines = 160) {
 }
 
 async function main() {
-  const defaultBranch = `feat/ai-run-${new Date().toISOString().replace(/[:.]/g, "-")}`;
+  const defaultBranch = `feat/ai-run-${new Date()
+    .toISOString()
+    .replace(/[:.]/g, "-")}`;
   const branch = process.argv[2] ?? process.env.AI_BRANCH ?? defaultBranch;
   const commitMsg = process.argv[3] ?? "chore: apply ai patch";
 
@@ -826,19 +614,20 @@ async function main() {
 
   const requiredFiles = parseRequiredFilesFromTask(task);
 
+  // Models
   const openaiModel = readString("OPENAI_MODEL", "gpt-5.2");
   const claudeModel = readString("ANTHROPIC_MODEL", "claude-sonnet-4-5");
 
-  const maxOutputTokens = readNumber("AI_MAX_OUTPUT_TOKENS", 2200);
-  const temperature = readOptionalNumber("AI_TEMPERATURE");
+  // Tokens/temperature knobs
+  const maxOutputTokens = readNumber("ANTHROPIC_MAX_OUTPUT_TOKENS", 2200);
+  const temperature = readOptionalNumber("ANTHROPIC_TEMPERATURE");
 
   let previousOut = "";
-  let previousPatch = "";
-  let previousFileContext = "";
   let success = false;
 
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
+      // attempt 1: OpenAI (code). attempt 2-3: Anthropic (fix/review)
       const provider = attempt === 1 ? "openai" : "anthropic";
       const model = provider === "openai" ? openaiModel : claudeModel;
 
@@ -856,27 +645,12 @@ async function main() {
           : [
               "Your previous output was invalid or failed quality gates.",
               "Regenerate a correct unified diff with full headers and at least one @@ hunk per file.",
-              "If git apply failed, your diff did not match the repo files. Use the provided CURRENT_WORKTREE_FILE_SNAPSHOTS to craft hunks that apply cleanly.",
               "Do not output header-only diffs (e.g., index ...e69de29).",
               "Fix issues reported in the gates log if provided.",
               "Reminder: no @testing-library/*, no toBeInTheDocument, no app/**/__tests__.",
             ].join(" ");
 
       await cleanupArtifacts();
-
-      const extraContext =
-        attempt === 1
-          ? ""
-          : [
-              previousPatch
-                ? "# PREVIOUS_PATCH_DIFF\n```diff\n" +
-                  previousPatch.trimEnd() +
-                  "\n```\n"
-                : "",
-              previousFileContext || "",
-            ]
-              .filter(Boolean)
-              .join("\n\n");
 
       await callAgent({
         provider,
@@ -889,9 +663,9 @@ async function main() {
         extraRules,
         attempt,
         previousOut,
-        extraContext,
       });
 
+      // dry-run gates
       const dry = spawnSync(
         "node",
         ["scripts/ai-pr.mjs", branch, commitMsg, "--dry-run"],
@@ -915,13 +689,6 @@ async function main() {
           previousOut = debug;
         }
 
-        if (existsSync(PATCH_PATH)) {
-          previousPatch = await fs.readFile(PATCH_PATH, "utf8").catch(() => "");
-          previousFileContext = previousPatch
-            ? await buildCurrentFileContextFromDiff(previousPatch)
-            : "";
-        }
-
         if (attempt === 3)
           throw new Error(`Dry-run failed. See ${GATES_LOG_PATH}`);
         continue;
@@ -937,13 +704,6 @@ async function main() {
         previousOut = last;
       } catch {
         // ignore
-      }
-
-      if (existsSync(PATCH_PATH)) {
-        previousPatch = await fs.readFile(PATCH_PATH, "utf8").catch(() => "");
-        previousFileContext = previousPatch
-          ? await buildCurrentFileContextFromDiff(previousPatch)
-          : "";
       }
 
       if (attempt === 3) throw e;
