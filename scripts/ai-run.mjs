@@ -606,7 +606,8 @@ function tail(text, lines = 160) {
 }
 
 async function main() {
-  const branch = process.argv[2] ?? "feat/ai-run";
+  const defaultBranch = `feat/ai-run-${new Date().toISOString().replace(/[:.]/g, "-")}`;
+  const branch = process.argv[2] ?? process.env.AI_BRANCH ?? defaultBranch;
   const commitMsg = process.argv[3] ?? "chore: apply ai patch";
 
   await cleanupArtifacts();

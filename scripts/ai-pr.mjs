@@ -392,7 +392,10 @@ function main() {
   // 커밋/푸시/PR
   must("git", ["add", "-A"]);
   must("git", ["commit", "-m", title]);
-  must("git", ["push", "-u", "origin", branch]);
+  const forcePush = readEnv("AI_FORCE_PUSH") === "1";
+  const pushArgs = ["push", "-u", "origin", branch];
+  if (forcePush) pushArgs.push("--force-with-lease");
+  must("git", pushArgs);
 
   // IMPORTANT: enforce our AI PR body (no --fill)
   const prArgs = ["pr", "create", "--title", title];
