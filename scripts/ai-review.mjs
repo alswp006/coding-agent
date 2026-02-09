@@ -10,12 +10,31 @@ function mustEnv(name) {
   return v;
 }
 
-function clip(s, maxChars) {
-  if (!s) return "";
-  return s.length > maxChars ? s.slice(0, maxChars) + "\n\n[TRUNCATED]\n" : s;
+function readEnv(name, fallback = "") {
+  const v = process.env[name];
+  return v ? String(v) : fallback;
 }
 
-async function ghFetch(path, { token, method = "GET", headers = {}, body } = {}) {
+function clip(s, maxChars) {
+  if (!s) return "";
+  const str = String(s);
+  return str.length > maxChars
+    ? str.slice(0, maxChars) + "\n\n[TRUNCATED]\n"
+    : str;
+}
+
+function clipBytes(s, maxBytes) {
+  // UTF-8 byte-based clip (safer for API limits than char-based)
+  const buf = Buffer.from(String(s || ""), "utf8");
+  if (buf.length <= maxBytes) return String(s || "");
+  const sliced = buf.subarray(0, maxBytes);
+  return sliced.toString("utf8") + "\n\n[TRUNCATED_BY_BYTES]\n";
+}
+
+async function ghFetch(
+  path,
+  { token, method = "GET", headers = {}, body } = {},
+) {
   const res = await fetch(`${GH_API}${path}`, {
     method,
     headers: {
@@ -26,10 +45,12 @@ async function ghFetch(path, { token, method = "GET", headers = {}, body } = {})
     },
     body,
   });
+
   if (!res.ok) {
     const t = await res.text().catch(() => "");
     throw new Error(`GitHub API ${method} ${path} failed: ${res.status} ${t}`);
   }
+
   const ct = res.headers.get("content-type") || "";
   if (ct.includes("application/json")) return await res.json();
   return await res.text();
@@ -44,10 +65,8 @@ async function ghPostComment({ token, owner, repo, issueNumber, body }) {
 }
 
 function getPrNumberFromEvent(event) {
-  // pull_request event payload
   const n = event?.pull_request?.number;
   if (typeof n === "number") return n;
-  // issue_comment etc fallback
   const n2 = event?.number;
   if (typeof n2 === "number") return n2;
   return null;
@@ -60,7 +79,59 @@ async function readTaskMd() {
   return t.trim() ? t : "(empty .ai/TASK.md)";
 }
 
-async function openaiReview({ apiKey, model, taskMd, prTitle, diffText, checksSummary }) {
+function summarizeChecks(checks) {
+  const lines = [];
+  for (const c of checks) {
+    const name = c.name || "(unnamed)";
+    const concl = c.conclusion || c.status || "unknown";
+    lines.push(`- ${name}: ${concl}`);
+  }
+  return lines.length ? lines.join("\n") : "(no checks found)";
+}
+
+/**
+ * Robust extraction for OpenAI Responses API.
+ * Handles: output_text, output[] content, and a few fallbacks.
+ */
+function extractTextFromResponsesApi(json) {
+  if (!json) return "";
+
+  if (typeof json.output_text === "string" && json.output_text.trim()) {
+    return json.output_text.trim();
+  }
+
+  if (Array.isArray(json.output)) {
+    let t = "";
+    for (const item of json.output) {
+      if (!item || !Array.isArray(item.content)) continue;
+      for (const part of item.content) {
+        if (!part) continue;
+        if (typeof part.text === "string") t += part.text;
+        if (typeof part.output_text === "string") t += part.output_text;
+      }
+    }
+    if (t.trim()) return t.trim();
+  }
+
+  // Extremely defensive fallbacks (rare)
+  if (Array.isArray(json.content)) {
+    const t = json.content
+      .map((p) => (p && typeof p.text === "string" ? p.text : ""))
+      .join("");
+    if (t.trim()) return t.trim();
+  }
+
+  return "";
+}
+
+async function openaiReview({
+  apiKey,
+  model,
+  taskMd,
+  prTitle,
+  diffText,
+  checksSummary,
+}) {
   const instructions = [
     "You are a senior engineer reviewing a GitHub pull request.",
     "You must review for: spec compliance (TASK.md), correctness, edge cases, maintainability, test adequacy, and risk.",
@@ -75,7 +146,10 @@ async function openaiReview({ apiKey, model, taskMd, prTitle, diffText, checksSu
     "Do not include any other JSON or additional sections.",
   ].join("\n");
 
-  const input = [
+  // IMPORTANT:
+  // - Responses API input can be large; guard with byte clipping.
+  // - Keep structure stable to reduce empty outputs.
+  const prBlock = [
     `PR Title: ${prTitle}`,
     "",
     "=== TASK.md ===",
@@ -88,10 +162,17 @@ async function openaiReview({ apiKey, model, taskMd, prTitle, diffText, checksSu
     clip(diffText, 90_000),
   ].join("\n");
 
+  // Byte-based clip for safety (GitHub diff can be huge)
+  const safeInput = clipBytes(prBlock, 220_000); // ~220KB hard cap (tune if needed)
+
+  // Responses API expects `input` - allow message array.
+  // Put "instructions" as system-like text in the first item for maximum compatibility.
   const payload = {
     model,
-    instructions,
-    input,
+    input: [
+      { role: "system", content: instructions },
+      { role: "user", content: safeInput },
+    ],
     max_output_tokens: 1800,
     store: false,
   };
@@ -105,32 +186,50 @@ async function openaiReview({ apiKey, model, taskMd, prTitle, diffText, checksSu
     body: JSON.stringify(payload),
   });
 
+  const raw = await res.text().catch(() => "");
   if (!res.ok) {
-    const t = await res.text().catch(() => "");
-    throw new Error(`OpenAI API failed: ${res.status} ${t}`);
+    throw new Error(`OpenAI API failed: ${res.status} ${raw}`);
   }
 
-  const j = await res.json();
-  const out = (j.output_text ?? "").trim();
-  if (!out) throw new Error("OpenAI returned empty output");
+  let j;
+  try {
+    j = raw ? JSON.parse(raw) : null;
+  } catch {
+    throw new Error(
+      `OpenAI API returned non-JSON response (len=${raw.length})`,
+    );
+  }
+
+  const out = extractTextFromResponsesApi(j);
+  if (!out) {
+    // helpful debug without leaking secrets
+    const dbg = {
+      model,
+      id: j?.id,
+      has_output_text: typeof j?.output_text === "string",
+      output_len: Array.isArray(j?.output) ? j.output.length : 0,
+      usage: j?.usage ? { ...j.usage } : undefined,
+    };
+    throw new Error(
+      `OpenAI returned empty output. debug=${JSON.stringify(dbg)}`,
+    );
+  }
   return out;
-}
-
-function summarizeChecks(checks) {
-  // checks: list of check-runs (name, conclusion, status, details_url)
-  const lines = [];
-  for (const c of checks) {
-    const name = c.name || "(unnamed)";
-    const concl = c.conclusion || c.status || "unknown";
-    lines.push(`- ${name}: ${concl}`);
-  }
-  return lines.length ? lines.join("\n") : "(no checks found)";
 }
 
 async function main() {
   const token = mustEnv("GITHUB_TOKEN");
   const apiKey = mustEnv("OPENAI_API_KEY");
-  const model = process.env.OPENAI_MODEL || "gpt-4.1-mini";
+
+  const model = readEnv("OPENAI_MODEL", "gpt-4.1-mini");
+
+  // 운영 옵션:
+  // - AI_REVIEW_SOFT_FAIL=1 이면 OpenAI 실패 시에도 exit 0 (CI를 죽이지 않음)
+  const softFail = readEnv("AI_REVIEW_SOFT_FAIL", "") === "1";
+
+  // quick debug (no secret)
+  console.log(`[ai-review] model=${model}`);
+  console.log(`[ai-review] openai_key_len=${apiKey?.length ?? 0}`);
 
   const eventPath = mustEnv("GITHUB_EVENT_PATH");
   const eventRaw = await fs.readFile(eventPath, "utf8");
@@ -139,9 +238,12 @@ async function main() {
   const repoFull = mustEnv("GITHUB_REPOSITORY"); // owner/repo
   const [owner, repo] = repoFull.split("/");
   const prNumber = getPrNumberFromEvent(event);
-  if (!prNumber) throw new Error("Could not determine PR number from event payload");
+  if (!prNumber)
+    throw new Error("Could not determine PR number from event payload");
 
-  const pr = await ghFetch(`/repos/${owner}/${repo}/pulls/${prNumber}`, { token });
+  const pr = await ghFetch(`/repos/${owner}/${repo}/pulls/${prNumber}`, {
+    token,
+  });
   const prTitle = pr.title || `(PR #${prNumber})`;
 
   // 1) diff
@@ -154,7 +256,10 @@ async function main() {
   const ref = pr.head?.sha;
   let checksSummary = "(no check-runs)";
   if (ref) {
-    const checks = await ghFetch(`/repos/${owner}/${repo}/commits/${ref}/check-runs`, { token });
+    const checks = await ghFetch(
+      `/repos/${owner}/${repo}/commits/${ref}/check-runs`,
+      { token },
+    );
     const runs = Array.isArray(checks.check_runs) ? checks.check_runs : [];
     checksSummary = summarizeChecks(runs);
   }
@@ -163,14 +268,49 @@ async function main() {
   const taskMd = await readTaskMd();
 
   // 4) openai review
-  const body = await openaiReview({
-    apiKey,
-    model,
-    taskMd,
-    prTitle,
-    diffText,
-    checksSummary,
-  });
+  let body = "";
+  try {
+    body = await openaiReview({
+      apiKey,
+      model,
+      taskMd,
+      prTitle,
+      diffText,
+      checksSummary,
+    });
+  } catch (e) {
+    const msg = e?.message || String(e);
+    console.error("[ai-review] OpenAI review failed:", msg);
+
+    if (softFail) {
+      // Leave a comment indicating skip, but do not fail CI
+      const notice = [
+        "## AI Review Skipped",
+        "",
+        "AI review step failed to produce output in this run.",
+        "",
+        "### Error",
+        "```",
+        clip(msg, 2000),
+        "```",
+        "",
+        "_This comment was generated by ai-review._",
+      ].join("\n");
+
+      await ghPostComment({
+        token,
+        owner,
+        repo,
+        issueNumber: prNumber,
+        body: notice,
+      });
+
+      console.log("[ai-review] soft-fail enabled; exiting 0");
+      process.exit(0);
+    }
+
+    throw e;
+  }
 
   const marker = "\n\n---\n\n_This comment was generated by ai-review._";
   await ghPostComment({
