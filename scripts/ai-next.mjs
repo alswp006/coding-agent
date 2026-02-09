@@ -35,7 +35,9 @@ async function main() {
   const cursor = Number.isFinite(state.cursor) ? state.cursor : 0;
 
   if (cursor >= queue.items.length) {
-    console.log(`[ai:next] done. cursor=${cursor}, items=${queue.items.length}`);
+    console.log(
+      `[ai:next] done. cursor=${cursor}, items=${queue.items.length}`,
+    );
     return;
   }
 
@@ -62,9 +64,17 @@ async function main() {
   if (!okRun) throw new Error("ai-run failed");
 
   // 3) cursor++ (로컬 상태만 업데이트)
-  const nextState = { cursor: cursor + 1, last: wpPath, updated_at: new Date().toISOString() };
+  const nextState = {
+    cursor: cursor + 1,
+    last: wpPath,
+    updated_at: new Date().toISOString(),
+  };
   await fs.mkdir(path.dirname(STATE_FILE), { recursive: true });
-  await fs.writeFile(STATE_FILE, JSON.stringify(nextState, null, 2) + "\n", "utf8");
+  await fs.writeFile(
+    STATE_FILE,
+    JSON.stringify(nextState, null, 2) + "\n",
+    "utf8",
+  );
 
   console.log(`[ai:next] success. cursor -> ${cursor + 1}`);
   console.log(`[ai:next] state saved: ${STATE_FILE}`);

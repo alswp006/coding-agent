@@ -15,7 +15,10 @@ function clip(s, maxChars) {
   return s.length > maxChars ? s.slice(0, maxChars) + "\n\n[TRUNCATED]\n" : s;
 }
 
-async function ghFetch(path, { token, method = "GET", headers = {}, body } = {}) {
+async function ghFetch(
+  path,
+  { token, method = "GET", headers = {}, body } = {},
+) {
   const res = await fetch(`${GH_API}${path}`, {
     method,
     headers: {
@@ -60,7 +63,14 @@ async function readTaskMd() {
   return t.trim() ? t : "(empty .ai/TASK.md)";
 }
 
-async function openaiReview({ apiKey, model, taskMd, prTitle, diffText, checksSummary }) {
+async function openaiReview({
+  apiKey,
+  model,
+  taskMd,
+  prTitle,
+  diffText,
+  checksSummary,
+}) {
   const instructions = [
     "You are a senior engineer reviewing a GitHub pull request.",
     "You must review for: spec compliance (TASK.md), correctness, edge cases, maintainability, test adequacy, and risk.",
@@ -139,9 +149,12 @@ async function main() {
   const repoFull = mustEnv("GITHUB_REPOSITORY"); // owner/repo
   const [owner, repo] = repoFull.split("/");
   const prNumber = getPrNumberFromEvent(event);
-  if (!prNumber) throw new Error("Could not determine PR number from event payload");
+  if (!prNumber)
+    throw new Error("Could not determine PR number from event payload");
 
-  const pr = await ghFetch(`/repos/${owner}/${repo}/pulls/${prNumber}`, { token });
+  const pr = await ghFetch(`/repos/${owner}/${repo}/pulls/${prNumber}`, {
+    token,
+  });
   const prTitle = pr.title || `(PR #${prNumber})`;
 
   // 1) diff
@@ -154,7 +167,10 @@ async function main() {
   const ref = pr.head?.sha;
   let checksSummary = "(no check-runs)";
   if (ref) {
-    const checks = await ghFetch(`/repos/${owner}/${repo}/commits/${ref}/check-runs`, { token });
+    const checks = await ghFetch(
+      `/repos/${owner}/${repo}/commits/${ref}/check-runs`,
+      { token },
+    );
     const runs = Array.isArray(checks.check_runs) ? checks.check_runs : [];
     checksSummary = summarizeChecks(runs);
   }
