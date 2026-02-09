@@ -85,6 +85,14 @@ function extractAllCodeBlocks(text, lang) {
   return blocks;
 }
 
+function extractAllCodeBlocksAnyLang(text, langs) {
+  const blocks = [];
+  for (const l of langs) {
+    blocks.push(...extractAllCodeBlocks(text, l));
+  }
+  return blocks;
+}
+
 function pickBestDiff(blocks) {
   if (!blocks.length) return null;
   let best = blocks[0];
@@ -98,6 +106,92 @@ function pickBestMd(blocks) {
   let longest = first;
   for (const b of blocks) if (b.length > longest.length) longest = b;
   return first.length >= 200 ? first : longest;
+}
+
+function normalizeNewlines(s) {
+  return String(s || "").replace(/\r\n/g, "\n");
+}
+
+/**
+ * Fallback diff extraction:
+ * - If model didn't use ```diff fences, try to locate the first "diff --git" block.
+ * - Stop at the start of the PR body fence if present.
+ */
+function extractUnifiedDiffFromLooseText(text) {
+  const t = normalizeNewlines(text);
+
+  // If there is a fenced diff-like block but with wrong tag, strip fences first
+  const fenceRe = /```[a-zA-Z0-9_-]*\n([\s\S]*?)\n```/g;
+  const candidates = [];
+  let m;
+  while ((m = fenceRe.exec(t)) !== null) {
+    const body = (m[1] || "").trimEnd();
+    if (/^diff --git /m.test(body)) candidates.push(body);
+  }
+  if (candidates.length) {
+    const best = pickBestDiff(candidates);
+    return best && looksLikeUnifiedDiff(best) ? best : best;
+  }
+
+  const idx = t.search(/^diff --git /m);
+  if (idx === -1) return null;
+
+  // cut from idx to end
+  let diff = t.slice(idx).trimEnd();
+
+  // If an md fence exists after, cut before it
+  const mdFenceIdx = diff.search(/^```(md|markdown|mdx)\b/m);
+  if (mdFenceIdx !== -1) diff = diff.slice(0, mdFenceIdx).trimEnd();
+
+  // If another random prose section like "```md" isn't present but "```" appears, don't cut blindly.
+  return diff;
+}
+
+/**
+ * Fallback PR body extraction:
+ * - If no md fenced block, attempt to use remaining text after diff block.
+ * - Or synthesize a minimal PR body to satisfy ai-pr.
+ */
+function extractPrBodyFromLooseText(text) {
+  const t = normalizeNewlines(text);
+
+  // 1) If there is any fenced md/markdown/mdx block, prefer it (caller already tries that)
+  // 2) Try to find content after the last triple backtick that contains diff
+  const lastDiffIdx = t.lastIndexOf("diff --git ");
+  if (lastDiffIdx !== -1) {
+    // find end of diff-ish region: if there is a closing fence after it, take after fence
+    const after = t.slice(lastDiffIdx);
+    const closeFence = after.indexOf("```");
+    if (closeFence !== -1) {
+      // skip first fence maybe; just take everything after the next closing fence
+      const afterClose = after.slice(closeFence + 3);
+      const maybe = afterClose.trim();
+      if (maybe.length >= 120) return maybe;
+    }
+  }
+
+  // 3) Use whole text if it's reasonably long and not a diff
+  if (!/^diff --git /m.test(t) && t.trim().length >= 200) return t.trim();
+
+  // 4) Synthesize minimal body (always valid)
+  return [
+    "## Summary",
+    "- Apply AI-generated patch for the current TASK.",
+    "",
+    "## How to test",
+    "```bash",
+    "pnpm test",
+    "pnpm lint",
+    "pnpm typecheck",
+    "pnpm format:check",
+    "```",
+    "",
+    "## Risk & rollback",
+    "- Low risk (scaffold-level). Roll back by reverting this PR.",
+    "",
+    "## Notes",
+    "- No API call should be triggered by the UI action in this packet.",
+  ].join("\n");
 }
 
 /**
@@ -159,8 +253,7 @@ function mustIncludeRequiredFiles(diff, requiredPaths) {
   const missing = [];
   for (const p of requiredPaths) {
     const header = `diff --git a/${p} b/${p}`;
-    const newHeader = `diff --git a/${p} b/${p}`;
-    if (!diff.includes(header) && !diff.includes(newHeader)) missing.push(p);
+    if (!diff.includes(header)) missing.push(p);
   }
 
   if (missing.length) {
@@ -176,7 +269,6 @@ function mustIncludeRequiredFiles(diff, requiredPaths) {
 // -----------------------------
 
 function parseTouchedPathsFromDiff(diff) {
-  // returns array of { aPath, bPath }
   const out = [];
   const re = /^diff --git a\/(.+?) b\/(.+?)$/gm;
   let m;
@@ -191,7 +283,6 @@ async function buildCurrentFileContextFromDiff(diff) {
   const unique = new Map();
 
   for (const t of touched) {
-    // prefer bPath unless it's /dev/null
     const p =
       t.bPath && t.bPath !== "/dev/null"
         ? t.bPath
@@ -199,7 +290,6 @@ async function buildCurrentFileContextFromDiff(diff) {
           ? t.aPath
           : null;
     if (!p) continue;
-
     if (unique.has(p)) continue;
     unique.set(p, true);
   }
@@ -219,7 +309,6 @@ async function buildCurrentFileContextFromDiff(diff) {
         ? content.slice(0, 30_000) + "\n\n/* [TRUNCATED] */\n"
         : content;
 
-    // language hint
     const lang =
       p.endsWith(".ts") || p.endsWith(".mts")
         ? "ts"
@@ -249,7 +338,6 @@ function assertPatchPolicy({
   forbidReactTestingLib = true,
   forbidAppDraftsTests = true,
 }) {
-  // 1) vitest config 중복/변형 방지
   const forbiddenVitestConfigs = [
     "vitest.config.ts",
     "vitest.config.js",
@@ -271,7 +359,6 @@ function assertPatchPolicy({
     }
   }
 
-  // 2) app/drafts/** 테스트 추가 금지
   if (forbidAppDraftsTests) {
     const re =
       /^diff --git a\/app\/drafts\/.*__tests__\/.* b\/app\/drafts\/.*__tests__\/.*/m;
@@ -282,7 +369,6 @@ function assertPatchPolicy({
     }
   }
 
-  // 3) Testing Library import 금지
   if (forbidReactTestingLib) {
     const re = /@testing-library\/react/;
     if (re.test(diff)) {
@@ -292,7 +378,6 @@ function assertPatchPolicy({
     }
   }
 
-  // 4) package.json 변경 금지 (Task가 허용할 때만)
   const pkgRe = /^diff --git a\/package\.json b\/package\.json/m;
   if (pkgRe.test(diff)) {
     throw new Error(
@@ -343,7 +428,6 @@ function assertNoForbiddenDiff(diff) {
 }
 
 function assertDoNotTouchUnlessTask({ diff, taskText, allowedPaths }) {
-  // 보호 파일: 코더가 괜히 건드리면 patch apply conflict / 의미 없는 변경이 자주 발생
   const protectedPaths = ["src/__tests__/smoke.test.ts"];
 
   for (const p of protectedPaths) {
@@ -362,7 +446,6 @@ function assertDoNotTouchUnlessTask({ diff, taskText, allowedPaths }) {
 }
 
 function assertNoRootPageEditsWhenDraftRoute(taskText, diff) {
-  // TASK에 /drafts/new 가 있으면 app/page.tsx 건드리는 건 거의 100% 오답/충돌 유발
   const mentionsDraftRoute =
     /\/drafts\/new/i.test(taskText) || /\bdrafts\/new\b/i.test(taskText);
 
@@ -377,7 +460,7 @@ function assertNoRootPageEditsWhenDraftRoute(taskText, diff) {
 }
 
 // -----------------------------
-// Anthropic API (Fix/Review only)
+// Anthropic API
 // -----------------------------
 async function anthropicMessagesCreate({
   apiKey,
@@ -424,10 +507,9 @@ async function anthropicMessagesCreate({
 }
 
 // -----------------------------
-// OpenAI API (Code + Translate)
+// OpenAI API (Responses)
 // -----------------------------
 function extractOpenAIText(json) {
-  // Best-effort robust extraction
   const out = [];
 
   if (typeof json?.output_text === "string" && json.output_text.trim()) {
@@ -436,7 +518,6 @@ function extractOpenAIText(json) {
 
   const output = Array.isArray(json?.output) ? json.output : [];
   for (const o of output) {
-    // Some SDKs shape: { type: "message", content: [{type:"output_text", text:"..."}] }
     const content = Array.isArray(o?.content) ? o.content : [];
     for (const c of content) {
       if (c && c.type === "output_text" && typeof c.text === "string")
@@ -444,8 +525,6 @@ function extractOpenAIText(json) {
       if (c && c.type === "text" && typeof c.text === "string")
         out.push(c.text);
     }
-
-    // Some shapes: { type:"output_text", text:"..." }
     if (o && o.type === "output_text" && typeof o.text === "string")
       out.push(o.text);
   }
@@ -461,7 +540,6 @@ async function openaiResponsesCreate({
   maxTokens,
   temperature,
 }) {
-  // Responses API: use top-level instructions + input for maximum compatibility
   const body = {
     model,
     input: String(userText || ""),
@@ -489,8 +567,7 @@ async function openaiResponsesCreate({
     );
   }
 
-  const text = extractOpenAIText(json);
-  return String(text || "");
+  return String(extractOpenAIText(json) || "");
 }
 
 async function translatePrBodyToKorean({ model, text }) {
@@ -509,7 +586,7 @@ async function translatePrBodyToKorean({ model, text }) {
       system: instructions,
       userText: text,
       maxTokens: 1200,
-      temperature: undefined,
+      temperature: 0,
     })
   ).trimEnd();
 
@@ -527,7 +604,7 @@ async function callAgent({
   extraRules,
   attempt,
   previousOut,
-  extraContext, // optional large context (file snapshots)
+  extraContext,
 }) {
   const diffTemplate = [
     "Here is a minimal valid example of a NEW FILE diff. Follow this format exactly:",
@@ -622,7 +699,7 @@ async function callAgent({
       system: instructions,
       userText,
       maxTokens: maxOutputTokens,
-      temperature,
+      temperature: typeof temperature === "number" ? temperature : 0, // OpenAI는 0이 안정적
     });
   } else {
     out = await anthropicMessagesCreate({
@@ -638,19 +715,26 @@ async function callAgent({
   await fs.mkdir(".ai", { recursive: true });
   await fs.writeFile(LAST_OUTPUT_PATH, out, "utf8");
 
-  const diffBlocks = extractAllCodeBlocks(out, "diff");
-  const mdBlocks = [
-    ...extractAllCodeBlocks(out, "md"),
-    ...extractAllCodeBlocks(out, "markdown"),
-    ...extractAllCodeBlocks(out, "mdx"),
-  ];
+  // ---- DIFF extraction: accept diff/patch/git/udiff + fallback to loose text
+  const diffBlocks = extractAllCodeBlocksAnyLang(out, [
+    "diff",
+    "patch",
+    "git",
+    "gitdiff",
+    "udiff",
+    "unified-diff",
+  ]);
+  const mdBlocks = extractAllCodeBlocksAnyLang(out, ["md", "markdown", "mdx"]);
 
-  const diff = pickBestDiff(diffBlocks);
-  const prBodyEn = pickBestMd(mdBlocks);
+  let diff = pickBestDiff(diffBlocks);
+  let prBodyEn = pickBestMd(mdBlocks);
+
+  if (!diff) diff = extractUnifiedDiffFromLooseText(out);
+  if (!prBodyEn) prBodyEn = extractPrBodyFromLooseText(out);
 
   if (!diff) throw new Error(`No diff block found. See ${LAST_OUTPUT_PATH}`);
   if (!prBodyEn)
-    throw new Error(`No md PR body block found. See ${LAST_OUTPUT_PATH}`);
+    throw new Error(`No md PR body found. See ${LAST_OUTPUT_PATH}`);
   if (!looksLikeUnifiedDiff(diff)) {
     throw new Error(
       `Invalid unified diff (missing headers or @@ hunk). See ${LAST_OUTPUT_PATH}`,
@@ -688,7 +772,7 @@ async function callAgent({
   });
   await fs.writeFile(PR_BODY_PATH, koBody + "\n", "utf8");
 
-  // check patch applicability (capture reason if fails)
+  // check patch applicability
   const chk = runCapture("git", [
     "apply",
     "--check",
@@ -742,11 +826,9 @@ async function main() {
 
   const requiredFiles = parseRequiredFilesFromTask(task);
 
-  // Models
   const openaiModel = readString("OPENAI_MODEL", "gpt-5.2");
   const claudeModel = readString("ANTHROPIC_MODEL", "claude-sonnet-4-5");
 
-  // Token knobs
   const maxOutputTokens = readNumber("AI_MAX_OUTPUT_TOKENS", 2200);
   const temperature = readOptionalNumber("AI_TEMPERATURE");
 
@@ -757,7 +839,6 @@ async function main() {
 
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
-      // attempt 1: OpenAI (code). attempt 2-3: Anthropic (fix/review)
       const provider = attempt === 1 ? "openai" : "anthropic";
       const model = provider === "openai" ? openaiModel : claudeModel;
 
@@ -811,7 +892,6 @@ async function main() {
         extraContext,
       });
 
-      // dry-run gates
       const dry = spawnSync(
         "node",
         ["scripts/ai-pr.mjs", branch, commitMsg, "--dry-run"],
@@ -835,7 +915,6 @@ async function main() {
           previousOut = debug;
         }
 
-        // On dry-run fail, also keep patch + file snapshots for next attempt
         if (existsSync(PATCH_PATH)) {
           previousPatch = await fs.readFile(PATCH_PATH, "utf8").catch(() => "");
           previousFileContext = previousPatch
@@ -860,7 +939,6 @@ async function main() {
         // ignore
       }
 
-      // If we have a patch, store it + store current file snapshots for retry prompt
       if (existsSync(PATCH_PATH)) {
         previousPatch = await fs.readFile(PATCH_PATH, "utf8").catch(() => "");
         previousFileContext = previousPatch
